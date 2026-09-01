@@ -1949,6 +1949,7 @@ def get_admin_menu(user_id):
                ibtn("📱 ALL NUMBERS", callback_data="admin_all_numbers", style="primary"))
     markup.add(ibtn("🚫 BLACKLIST", callback_data="admin_blacklist", style="danger"),
                ibtn("🛡️ ANTI-SPAM", callback_data="admin_anti_spam", style="primary"))
+    markup.add(ibtn("⚡ EVS PANEL", callback_data="admin_evs_panel", style="success"))
     if is_main_admin(user_id):
         markup.add(ibtn("👮 MANAGE ADMIN", callback_data="admin_manage_admins", style="danger"))
     markup.add(ibtn("❌ CLOSE", callback_data="close_menu", style="danger"))
@@ -1984,8 +1985,13 @@ def get_group_settings_menu():
     if fwd_groups:
         color_cycle_grp = ["primary", "success", "danger"]
         for g_idx, grp in enumerate(fwd_groups):
-            btn_count = len(grp.get('buttons', []))
-            markup.add(ibtn(f"⚙️ {grp['chat_id']} [{btn_count} BTNS]", callback_data=f"editgrp_{grp['chat_id']}", style=color_cycle_grp[g_idx % 3]))
+            if isinstance(grp, dict):
+                btn_count = len(grp.get('buttons', []))
+                grp_id = grp.get('chat_id', grp)
+                markup.add(ibtn(f"⚙️ {grp_id} [{btn_count} BTNS]", callback_data=f"editgrp_{grp_id}", style=color_cycle_grp[g_idx % 3]))
+            else:
+                # grp is a plain int/string (e.g. -1002309151984)
+                markup.add(ibtn(f"⚙️ {grp}", callback_data=f"editgrp_{grp}", style=color_cycle_grp[g_idx % 3]))
     if fwd_groups:
         markup.add(ibtn("📤 SEND TEST MESSAGE TO ALL GROUPS", callback_data="admin_send_test_msg", style="danger"))
     markup.add(ibtn("🔙 BACK", callback_data="back_to_admin", style="primary"))
@@ -2008,6 +2014,29 @@ def get_admin_system_menu():
     # ============================================
 #  PART 4 - MAIN DISPLAY FUNCTIONS
 # ============================================
+# ============ EVS ADMIN UI ============
+def show_evs_panel(chat_id, message_id=None):
+    d = load_data()
+    evs = d.get("evs_panel", {})
+    status = "\u26a1 ENABLED" if evs.get("enabled") else "\U0001f534 DISABLED"
+    status_style = "success" if evs.get("enabled") else "danger"
+    has_creds = bool(evs.get("username") and evs.get("password"))
+    creds_status = "\u2705 SET" if has_creds else "\u274c NOT SET"
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(ibtn(f"\u26a1 {status}", callback_data="evs_toggle", style=status_style))
+    markup.add(ibtn(f"\U0001f464 SET CREDENTIALS ({creds_status})", callback_data="evs_set_creds", style="primary"))
+    markup.add(ibtn("\U0001f9ea TEST CONNECTION", callback_data="evs_test", style="success"))
+    markup.add(ibtn("\U0001f519 BACK", callback_data="back_to_admin", style="primary"))
+    text = (
+        f"\u2728 <b>EVS SMS PANEL</b>\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"Status: {status}\n"
+        f"Credentials: {creds_status}\n"
+        f"URL: {EVS_BASE_URL}\n"
+        f"━━━━━━━━━━━━━━━"
+    )
+    safe_edit(chat_id, text, markup, message_id)
+
 
 
 # ============================================
@@ -4302,6 +4331,56 @@ def callback_handler(call):
         if not is_admin(chat_id):
             return
         user_states[chat_id] = {"state": "add_panel_name"}
+
+    # ============ EVS PANEL CALLBACKS ============
+    elif data == "admin_evs_panel":
+        bot.answer_callback_query(call.id)
+        if not is_admin(chat_id):
+            return
+        show_evs_panel(chat_id, message_id)
+
+    elif data == "evs_toggle":
+        bot.answer_callback_query(call.id)
+        if not is_admin(chat_id):
+            return
+        d = load_data()
+        evs = d.setdefault("evs_panel", {})
+        evs["enabled"] = not evs.get("enabled", False)
+        save_data(d)
+        status = "⚡ ENABLED" if evs["enabled"] else "🔴 DISABLED"
+        bot.answer_callback_query(call.id, f"EVS Monitor: {status}")
+        show_evs_panel(chat_id, message_id)
+
+    elif data == "evs_set_creds":
+        bot.answer_callback_query(call.id)
+        if not is_admin(chat_id):
+            return
+        user_states[chat_id] = {"state": "evs_set_username"}
+        safe_send(chat_id, "👤 <b>ENTER EVS USERNAME:</b>\n\n❌ /cancel to cancel")
+
+    elif data == "evs_test":
+        bot.answer_callback_query(call.id)
+        if not is_admin(chat_id):
+            return
+        d = load_data()
+        evs = d.get("evs_panel", {})
+        if not evs.get("username") or not evs.get("password"):
+            safe_send(chat_id, "❌ <b>NO CREDENTIALS SET!</b>\nSet username and password first.")
+            return
+        safe_send(chat_id, "🧪 <b>TESTING EVS CONNECTION...</b>")
+        session = evs_login(evs["username"], evs["password"])
+        if session:
+            otps = evs_fetch_otps(session)
+            safe_send(chat_id, f"✅ <b>EVS CONNECTION OK!</b>\n📊 <b>OTPs Found:</b> {len(otps)}")
+        else:
+            safe_send(chat_id, "❌ <b>EVS CONNECTION FAILED!</b>\nCheck your credentials.")
+        show_evs_panel(chat_id, message_id)
+
+
+        bot.answer_callback_query(call.id)
+        if not is_admin(chat_id):
+            return
+        user_states[chat_id] = {"state": "add_panel_name"}
         safe_send(chat_id, "📋 <b>ENTER PANEL NAME:</b>\n<i>e.g. Main API, Backup Panel</i>\n\n❌ /cancel to cancel")
 
     # ============ ADMIN USER VIEW ============
@@ -4344,11 +4423,29 @@ def callback_handler(call):
         uid = data.split("_", 1)[1]
         d = load_data()
         banned = d.get("banned_users", [])
+        # Fix type mismatch: check both str and int forms
+        uid_int = None
+        try:
+            uid_int = int(uid)
+        except (ValueError, TypeError):
+            pass
+        removed = False
         if uid in banned:
             banned.remove(uid)
+            removed = True
+        elif uid_int is not None and uid_int in banned:
+            banned.remove(uid_int)
+            removed = True
+        if removed:
             d["banned_users"] = banned
             save_data(d)
             bot.answer_callback_query(call.id, f"♻️ User {uid} unbanned!")
+            # Notify the unbanned user
+            try:
+                target_id = uid_int if uid_int is not None else uid
+                bot.send_message(target_id, "✅ <b>You have been UNBANNED!</b>\n\nYou can now use this bot again.", parse_mode="HTML")
+            except Exception:
+                pass
         show_unban_list(chat_id, message_id)
 
     # ============ ADMIN SYSTEM ACTIONS ============
@@ -5485,6 +5582,142 @@ def switch_panel_type(chat_id, panel_id, message_id=None):
 
 
 # -------------------- FORWARD GROUPS --------------------
+
+# ============ EVS SMS PANEL INTEGRATION ============
+EVS_BASE_URL = "http://57.129.107.62/ints"
+
+def evs_login(username, password):
+    """Login to EVS panel with math captcha solving."""
+    try:
+        sess = requests.Session()
+        resp = sess.get(f"{EVS_BASE_URL}/signin", timeout=10)
+        if resp.status_code != 200:
+            return None
+        captcha_match = re.search(r'(\d+)\s*([+\-*])\s*(\d+)', resp.text)
+        if not captcha_match:
+            return None
+        num1, op, num2 = int(captcha_match.group(1)), captcha_match.group(2), int(captcha_match.group(3))
+        if op == '+':
+            captcha_answer = num1 + num2
+        elif op == '-':
+            captcha_answer = num1 - num2
+        elif op == '*':
+            captcha_answer = num1 * num2
+        else:
+            captcha_answer = num1 + num2
+        login_data = {'username': username, 'password': password, 'captcha': str(captcha_answer)}
+        resp = sess.post(f"{EVS_BASE_URL}/signin", data=login_data, timeout=10, allow_redirects=True)
+        if resp.status_code == 200:
+            return sess
+        return None
+    except Exception as e:
+        log(f"[EVS LOGIN] Error: {e}")
+        return None
+
+def evs_fetch_otps(session):
+    """Fetch OTP records from EVS API."""
+    try:
+        resp = session.get(f"{EVS_BASE_URL}/api/getOtps", timeout=15)
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+        otps = []
+        records = data if isinstance(data, list) else data.get('data', data.get('records', []))
+        for rec in records:
+            otp_code = rec.get('otp', rec.get('code', rec.get('sms', '')))
+            service = rec.get('service', rec.get('app', rec.get('name', 'Unknown')))
+            phone = rec.get('phone', rec.get('number', ''))
+            if otp_code:
+                otps.append({'otp': str(otp_code), 'service': service, 'phone': phone})
+        return otps
+    except Exception as e:
+        log(f"[EVS FETCH] Error: {e}")
+        return []
+
+def evs_format_otp_message(otp_record):
+    """Format an OTP message for group forwarding."""
+    phone = otp_record.get('phone', '')
+    service = otp_record.get('service', 'Unknown')
+    otp_code = otp_record.get('otp', '')
+    country_flags = {'1': '\U0001f1fa\U0001f1f8', '7': '\U0001f1f7\U0001f1fa', '44': '\U0001f1ec\U0001f1e7',
+                     '91': '\U0001f1ee\U0001f1f3', '86': '\U0001f1e8\U0001f1f3', '234': '\U0001f1f3\U0001f1ec'}
+    cflag = ''
+    for code, flag in country_flags.items():
+        if phone.startswith(code):
+            cflag = flag
+            break
+    masked_num = phone[:7] + "****" + phone[-4:] if len(phone) > 11 else phone
+    formatted_otp = f"{otp_code[:3]}-{otp_code[3:]}" if len(otp_code) == 6 and otp_code.isdigit() else otp_code
+    ts = datetime.now().strftime("%H:%M:%S")
+    wm = load_data().get("watermark", "VERTEX OTP")
+    sep = "\u2501" * 13
+    return (
+        f"{wm}\n"
+        f"{sep}\n"
+        f"{cflag} \U0001f4f1 {service.upper()} \U0001f7e2\n"
+        f"\U0001f4f1 {masked_num}\n"
+        f"\U0001f511 OTP: {formatted_otp}\n"
+        f"Don't share this code with others\n"
+        f"\u23f0 {ts}"
+    )
+
+def evs_monitor_tick():
+    """One tick of the EVS monitor: fetch OTPs, forward to groups, match to sessions."""
+    d = load_data()
+    evs = d.get("evs_panel", {})
+    if not evs.get("enabled") or not evs.get("username") or not evs.get("password"):
+        return
+    session = evs_login(evs["username"], evs["password"])
+    if not session:
+        log("[EVS MONITOR] Login failed")
+        return
+    otps = evs_fetch_otps(session)
+    if not otps:
+        return
+    price = d.get("settings", {}).get("price_per_otp", 0.001)
+    for otp_rec in otps:
+        group_msg = evs_format_otp_message(otp_rec)
+        forward_to_forward_groups(group_msg)
+        phone = otp_rec.get('phone', '')
+        phone_clean = re.sub(r'\D', '', phone)
+        sessions = d.get("number_session", {})
+        for sid, sess in list(sessions.items()):
+            if sess.get("status") not in ("awaiting_otp", "polling"):
+                continue
+            num_clean = re.sub(r'\D', '', sess.get("number", ""))
+            if num_clean and (num_clean in phone_clean or phone_clean in num_clean):
+                otp_code = otp_rec.get('otp', '')
+                if not otp_code:
+                    continue
+                sess["status"] = "completed"
+                sess["otp_code"] = otp_code
+                d.setdefault("number_session", {})[sid] = sess
+                uid = str(sess.get("user_id"))
+                d.setdefault("balances", {})[uid] = d.get("balances", {}).get(uid, 0.0) + price
+                d.setdefault("otp_counts", {})[uid] = d.get("otp_counts", {}).get(uid, 0) + 1
+                save_data(d)
+                try:
+                    bot.send_message(sess.get("user_id"),
+                        f"\u2705 <b>EVS OTP RECEIVED!</b>\n"
+                        f"\U0001f4f1 <b>NUMBER:</b> <code>{sess.get('number', '')}</code>\n"
+                        f"\U0001f511 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n"
+                        f"\U0001f4b0 <b>EARNED:</b> ${price:.4f}",
+                        parse_mode="HTML")
+                except Exception:
+                    pass
+                log(f"[EVS MONITOR] Matched OTP {otp_code} -> session {sid}")
+                break
+    save_data(d)
+
+def _evs_monitor():
+    """Background daemon thread for EVS OTP monitoring."""
+    while True:
+        try:
+            evs_monitor_tick()
+        except Exception as e:
+            log(f"[EVS MONITOR ERROR] {e}")
+        time.sleep(15)
+
 def forward_to_forward_groups(text):
     data = load_data()
     groups = data.get("forward_groups", [])
@@ -5544,6 +5777,14 @@ def start_handler(message):
     first_name = message.from_user.first_name or "User"
     args = message.text.split()
     data = load_data()
+
+    # ---- BAN CHECK ----
+    if chat_id in data.get("banned_users", []):
+        try:
+            bot.send_message(chat_id, "\U0001f6ab You are BANNED from using this bot!", parse_mode="HTML")
+        except Exception:
+            pass
+        return
 
     # Register user
     if chat_id not in data.get("users", []):
@@ -5809,6 +6050,15 @@ def text_handler(message):
     chat_id = message.chat.id
     text = message.text.strip()
     first_name = message.from_user.first_name or "User"
+
+    # ---- BAN CHECK ----
+    _data = load_data()
+    if chat_id in _data.get("banned_users", []):
+        try:
+            bot.send_message(chat_id, "\U0001f6ab You are BANNED from using this bot!", parse_mode="HTML")
+        except Exception:
+            pass
+        return
 
     if text == "/cancel":
         user_states.pop(chat_id, None)
@@ -6370,6 +6620,11 @@ def text_handler(message):
                     d["banned_users"] = banned
                     save_data(d)
                     safe_send(chat_id, f"🔨 <b>USER BANNED:</b> <code>{bid}</code>")
+                    # Notify the banned user
+                    try:
+                        bot.send_message(bid, "🚫 <b>You have been BANNED!</b>\n\nYou can no longer use this bot. Contact support if you believe this is a mistake.", parse_mode="HTML")
+                    except Exception:
+                        pass
                 else:
                     safe_send(chat_id, "⚠️ <b>ALREADY BANNED</b>")
             except ValueError:
@@ -7232,6 +7487,27 @@ def text_handler(message):
             user_states.pop(chat_id, None)
             return
 
+
+        # ---- EVS STATE HANDLERS ----
+        if s == "evs_set_username":
+            d = load_data()
+            evs = d.setdefault("evs_panel", {})
+            evs["username"] = text.strip()
+            save_data(d)
+            user_states[chat_id] = {"state": "evs_set_password"}
+            safe_send(chat_id, "🔐 <b>ENTER EVS PASSWORD:</b>\n\n❌ /cancel to cancel")
+            return
+
+        if s == "evs_set_password":
+            d = load_data()
+            evs = d.setdefault("evs_panel", {})
+            evs["password"] = text.strip()
+            save_data(d)
+            user_states.pop(chat_id, None)
+            safe_send(chat_id, "✅ <b>EVS CREDENTIALS SAVED!</b>\n\n👤 Username: " + html.escape(evs.get("username", "")))
+            show_evs_panel(chat_id)
+            return
+
         # Unknown state fallback
         user_states.pop(chat_id, None)
         show_main_menu(chat_id, first_name)
@@ -7478,6 +7754,12 @@ if __name__ == "__main__":
     _os = threading.Thread(target=_otp_scanner, daemon=True)
     _os.start()
     log("[OTP SCANNER] Background started (15s)")
+
+
+    # EVS SMS Panel monitor
+    _evs_mt = threading.Thread(target=_evs_monitor, daemon=True)
+    _evs_mt.start()
+    log("[EVS MONITOR] Background started (15s)")
 
     while True:
         try:
