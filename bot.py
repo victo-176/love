@@ -4332,50 +4332,6 @@ def callback_handler(call):
             return
         user_states[chat_id] = {"state": "add_panel_name"}
 
-    # ============ EVS PANEL CALLBACKS ============
-    elif data == "admin_evs_panel":
-        bot.answer_callback_query(call.id)
-        if not is_admin(chat_id):
-            return
-        show_evs_panel(chat_id, message_id)
-
-    elif data == "evs_toggle":
-        bot.answer_callback_query(call.id)
-        if not is_admin(chat_id):
-            return
-        d = load_data()
-        evs = d.setdefault("evs_panel", {})
-        evs["enabled"] = not evs.get("enabled", False)
-        save_data(d)
-        status = "⚡ ENABLED" if evs["enabled"] else "🔴 DISABLED"
-        bot.answer_callback_query(call.id, f"EVS Monitor: {status}")
-        show_evs_panel(chat_id, message_id)
-
-    elif data == "evs_set_creds":
-        bot.answer_callback_query(call.id)
-        if not is_admin(chat_id):
-            return
-        user_states[chat_id] = {"state": "evs_set_username"}
-        safe_send(chat_id, "👤 <b>ENTER EVS USERNAME:</b>\n\n❌ /cancel to cancel")
-
-    elif data == "evs_test":
-        bot.answer_callback_query(call.id)
-        if not is_admin(chat_id):
-            return
-        d = load_data()
-        evs = d.get("evs_panel", {})
-        if not evs.get("username") or not evs.get("password"):
-            safe_send(chat_id, "❌ <b>NO CREDENTIALS SET!</b>\nSet username and password first.")
-            return
-        safe_send(chat_id, "🧪 <b>TESTING EVS CONNECTION...</b>")
-        session = evs_login(evs["username"], evs["password"])
-        if session:
-            otps = evs_fetch_otps(session)
-            safe_send(chat_id, f"✅ <b>EVS CONNECTION OK!</b>\n📊 <b>OTPs Found:</b> {len(otps)}")
-        else:
-            safe_send(chat_id, "❌ <b>EVS CONNECTION FAILED!</b>\nCheck your credentials.")
-        show_evs_panel(chat_id, message_id)
-
 
     # ============ ADMIN USER VIEW ============
     elif data == "admin_user_view":
@@ -5508,8 +5464,41 @@ def handle_admin_callbacks(chat_id, message_id, data, call):
         user_states[chat_id] = {"state": "broadcast_by_balance"}
         safe_send(chat_id, "💰 <b>SEND TO USERS WITH BALANCE ABOVE</b>\nEnter minimum balance (USD)\n<i>e.g. 1.00</i>\n\n❌ /cancel to cancel")
 
+    # ============ EVS PANEL CALLBACKS ============
+    elif data == "admin_evs_panel":
+        show_evs_panel(chat_id, message_id)
+
+    elif data == "evs_toggle":
+        d = load_data()
+        evs = d.setdefault("evs_panel", {})
+        evs["enabled"] = not evs.get("enabled", False)
+        save_data(d)
+        status = "⚡ ENABLED" if evs["enabled"] else "🔴 DISABLED"
+        bot.answer_callback_query(call.id, f"EVS Monitor: {status}")
+        show_evs_panel(chat_id, message_id)
+
+    elif data == "evs_set_creds":
+        user_states[chat_id] = {"state": "evs_set_username"}
+        safe_send(chat_id, "👤 <b>ENTER EVS USERNAME:</b>\n\n❌ /cancel to cancel")
+
+    elif data == "evs_test":
+        d = load_data()
+        evs = d.get("evs_panel", {})
+        if not evs.get("username") or not evs.get("password"):
+            safe_send(chat_id, "❌ <b>NO CREDENTIALS SET!</b>\nSet username and password first.")
+            return
+        safe_send(chat_id, "🧪 <b>TESTING EVS CONNECTION...</b>")
+        session = evs_login(evs["username"], evs["password"])
+        if session:
+            otps = evs_fetch_otps(session)
+            safe_send(chat_id, f"✅ <b>EVS CONNECTION OK!</b>\n📊 <b>OTPs Found:</b> {len(otps)}")
+        else:
+            safe_send(chat_id, "❌ <b>EVS CONNECTION FAILED!</b>\nCheck your credentials.")
+        show_evs_panel(chat_id, message_id)
+
     else:
         log(f"[ADMIN CALLBACK] Unhandled: {data}")
+
 
 # -------------------- ADMIN PANEL ACTION HELPERS --------------------
 def admin_test_panel_connection(chat_id, panel_id, message_id=None):
