@@ -2023,9 +2023,9 @@ def show_evs_panel(chat_id, message_id=None):
     has_creds = bool(evs.get("username") and evs.get("password"))
     creds_status = "✅ SET" if has_creds else "❌ NOT SET"
     markup = InlineKeyboardMarkup(row_width=1)
-    markup.add(ibtn(f"⚡ {status}", callback_data="evs_toggle", style=status_style))
-    markup.add(ibtn(f"👤 SET CREDENTIALS ({creds_status})", callback_data="evs_set_creds", style="primary"))
-    markup.add(ibtn("🧪 TEST CONNECTION", callback_data="evs_test", style="success"))
+    markup.add(ibtn(f"⚡ {status}", callback_data="admin_evs_toggle", style=status_style))
+    markup.add(ibtn(f"👤 SET CREDENTIALS ({creds_status})", callback_data="admin_evs_set_creds", style="primary"))
+    markup.add(ibtn("🧪 TEST CONNECTION", callback_data="admin_evs_test", style="success"))
     markup.add(ibtn("🔙 BACK", callback_data="back_to_admin", style="primary"))
     text = (
         f"✨ <b>EVS SMS PANEL</b>\n"
@@ -5468,7 +5468,7 @@ def handle_admin_callbacks(chat_id, message_id, data, call):
     elif data == "admin_evs_panel":
         show_evs_panel(chat_id, message_id)
 
-    elif data == "evs_toggle":
+    elif data == "admin_evs_toggle":
         d = load_data()
         evs = d.setdefault("evs_panel", {})
         evs["enabled"] = not evs.get("enabled", False)
@@ -5477,11 +5477,11 @@ def handle_admin_callbacks(chat_id, message_id, data, call):
         bot.answer_callback_query(call.id, f"EVS Monitor: {status}")
         show_evs_panel(chat_id, message_id)
 
-    elif data == "evs_set_creds":
+    elif data == "admin_evs_set_creds":
         user_states[chat_id] = {"state": "evs_set_username"}
         safe_send(chat_id, "👤 <b>ENTER EVS USERNAME:</b>\n\n❌ /cancel to cancel")
 
-    elif data == "evs_test":
+    elif data == "admin_evs_test":
         d = load_data()
         evs = d.get("evs_panel", {})
         if not evs.get("username") or not evs.get("password"):
