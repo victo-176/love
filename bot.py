@@ -4331,6 +4331,7 @@ def callback_handler(call):
         if not is_admin(chat_id):
             return
         user_states[chat_id] = {"state": "add_panel_name"}
+        safe_send(chat_id, "📊 <b>ADD NEW PANEL</b>\n\nEnter the <b>PANEL NAME</b>\n<i>e.g. My SMS Panel</i>\n\n❌ /cancel to cancel")
 
 
     # ============ ADMIN USER VIEW ============
