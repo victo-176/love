@@ -2018,22 +2018,22 @@ def get_admin_system_menu():
 def show_evs_panel(chat_id, message_id=None):
     d = load_data()
     evs = d.get("evs_panel", {})
-    status = "\u26a1 ENABLED" if evs.get("enabled") else "\U0001f534 DISABLED"
+    status = "⚡ ENABLED" if evs.get("enabled") else "🔴 DISABLED"
     status_style = "success" if evs.get("enabled") else "danger"
     has_creds = bool(evs.get("username") and evs.get("password"))
-    creds_status = "\u2705 SET" if has_creds else "\u274c NOT SET"
+    creds_status = "✅ SET" if has_creds else "❌ NOT SET"
     markup = InlineKeyboardMarkup(row_width=1)
-    markup.add(ibtn(f"\u26a1 {status}", callback_data="evs_toggle", style=status_style))
-    markup.add(ibtn(f"\U0001f464 SET CREDENTIALS ({creds_status})", callback_data="evs_set_creds", style="primary"))
-    markup.add(ibtn("\U0001f9ea TEST CONNECTION", callback_data="evs_test", style="success"))
-    markup.add(ibtn("\U0001f519 BACK", callback_data="back_to_admin", style="primary"))
+    markup.add(ibtn(f"⚡ {status}", callback_data="evs_toggle", style=status_style))
+    markup.add(ibtn(f"👤 SET CREDENTIALS ({creds_status})", callback_data="evs_set_creds", style="primary"))
+    markup.add(ibtn("🧪 TEST CONNECTION", callback_data="evs_test", style="success"))
+    markup.add(ibtn("🔙 BACK", callback_data="back_to_admin", style="primary"))
     text = (
-        f"\u2728 <b>EVS SMS PANEL</b>\n"
-        f"━━━━━━━━━━━━━━━\n"
+        f"✨ <b>EVS SMS PANEL</b>\n"
+        f"━━━━━━━━━━━━━\n"
         f"Status: {status}\n"
         f"Credentials: {creds_status}\n"
         f"URL: {EVS_BASE_URL}\n"
-        f"━━━━━━━━━━━━━━━"
+        f"━━━━━━━━━━━━━"
     )
     safe_edit(chat_id, text, markup, message_id)
 
@@ -4376,12 +4376,6 @@ def callback_handler(call):
             safe_send(chat_id, "❌ <b>EVS CONNECTION FAILED!</b>\nCheck your credentials.")
         show_evs_panel(chat_id, message_id)
 
-
-        bot.answer_callback_query(call.id)
-        if not is_admin(chat_id):
-            return
-        user_states[chat_id] = {"state": "add_panel_name"}
-        safe_send(chat_id, "📋 <b>ENTER PANEL NAME:</b>\n<i>e.g. Main API, Backup Panel</i>\n\n❌ /cancel to cancel")
 
     # ============ ADMIN USER VIEW ============
     elif data == "admin_user_view":
