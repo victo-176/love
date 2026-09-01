@@ -32,7 +32,7 @@ def log(msg):
 # ============================================
 # --- MULTI-ADMIN CONFIGURATION (NEW) ---
 # ============================================
-MAIN_ADMINS = [7696816703,8653648506]  # ⬅️ ADD/REMOVE MAIN ADMIN IDs HERE
+MAIN_ADMINS = [7696816703,8921746989]  # ⬅️ ADD/REMOVE MAIN ADMIN IDs HERE
 ADMIN_ID = MAIN_ADMINS[0]  # Primary admin (used as fallback for old references)
 
 def is_main_admin(user_id):
