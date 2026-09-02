@@ -1324,15 +1324,14 @@ def scraped_monitor_tick():
                         user_id = sess.get("user_id")
                         try:
                             bot.send_message(user_id,
-                                f"━━━━━━━━━━━━━━━\n"
-                                f"《 ✅ <b>OTP RECEIVED!</b> 》\n"
-                                f"━━━━━━━━━━━━━━━\n\n"
-                                f"📱 <b>NUMBER:</b> <code>{sess.get('number', '')}</code>\n"
-                                f"🔑 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n"
-                                f"💰 <b>EARNED:</b> ${price:.4f}\n"
-                                f"━━━━━━━━━━━━━━━\n"
-                                f"✅ <b>Auto-detected!</b>",
-                                parse_mode="HTML")
+                            f"━━━━━━━━━━━━━━\n"
+                            f"《 📱 <b>NEW SMS RECEIVED</b> 》\n"
+                            f"━━━━━━━━━━━━━━\n\n"
+                            f"📞 <b>Number:</b> <code>{number}</code>\n"
+                            f"🔑 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n\n"
+                            f"✅ <b>Auto-detected via MySmsPortal!</b>\n"
+                            f"━━━━━━━━━━━━━━",
+                            parse_mode="HTML")
                         except Exception as e:
                             log(f"[SCRAPED MONITOR] DM failed: {e}")
                         log(f"[SCRAPED MONITOR] DM match: {otp_code} -> {sess.get('number', '')}")
@@ -1522,16 +1521,14 @@ def evs_monitor_tick():
                 data.setdefault("otp_counts", {})[uid] = data.get("otp_counts", {}).get(uid, 0) + 1
                 try:
                     bot.send_message(user_id,
-                        f"━━━━━━━━━━━━━━━\n"
-                        f"《 ✅ <b>OTP RECEIVED!</b> 》\n"
-                        f"━━━━━━━━━━━━━━━\n\n"
-                        f"📱 <b>NUMBER:</b> <code>{sess_number}</code>\n"
-                        f"🔑 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n"
-                        f"📦 <b>SERVICE:</b> {emo(app_name)} {app_name.upper()}\n"
-                        f"💰 <b>EARNED:</b> ${price:.4f}\n"
-                        f"━━━━━━━━━━━━━━━\n"
-                        f"✅ <b>Auto-detected!</b>",
-                        parse_mode="HTML")
+                    f"━━━━━━━━━━━━━━\n"
+                    f"《 📱 <b>NEW SMS RECEIVED</b> 》\n"
+                    f"━━━━━━━━━━━━━━\n\n"
+                    f"📞 <b>Number:</b> <code>{sess_number}</code>\n"
+                    f"🔑 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n\n"
+                    f"✅ <b>Auto-detected via MySmsPortal!</b>\n"
+                    f"━━━━━━━━━━━━━━",
+                    parse_mode="HTML")
                 except Exception as e:
                     log(f"[EVS] DM notify failed: {e}")
                 log(f"[EVS] Matched OTP to user {uid}: {otp_code} -> {sess_number}")
@@ -2435,7 +2432,7 @@ def increment_sms_count():
 # ==================== FORCE JOIN SYSTEM ====================
 def get_force_join_buttons():
     data = load_data()
-    channels = data.get("force_join_channels", [])
+    channels = data.get("force_join_groups", []) or data.get("force_join_channels", [])
     markup = InlineKeyboardMarkup(row_width=1)
     for ch in channels:
         link = ch.get("link")
@@ -4452,6 +4449,35 @@ def callback_handler(call):
             safe_send(chat_id, "⚠️ <b>ACCESS DENIED</b> — <b>ADMIN ONLY</b> ⚠️")
             return
         handle_admin_callbacks(chat_id, message_id, data, call)
+        return
+
+    # ============ PANEL TYPE PICKER (was shadowed by catch-all) ============
+    elif data.startswith("ptype_"):
+        if not is_admin(chat_id):
+            bot.answer_callback_query(call.id)
+            return
+        bot.answer_callback_query(call.id)
+        parts = data.split("|")
+        if len(parts) < 2:
+            return
+        ptype = parts[0].replace("ptype_", "")
+        pid = parts[1]
+        d = load_data()
+        p = d.get("panels", {}).get(pid)
+        if not p:
+            return
+        panel_type = "agent" if "agent" in ptype else "client"
+        p["type"] = "scraped"
+        p["panel_type"] = panel_type
+        p["fetch_type"] = "scraped"
+        save_data(d)
+        bot.answer_callback_query(call.id, f"✅ {panel_type.upper()} Panel")
+        user_states[chat_id] = {"state": "scraped_panel_user", "panel_id": pid}
+        safe_send(chat_id,
+            f"✅ <b>Type:</b> {panel_type.upper()}\n\n"
+            f"👤 <b>ENTER USERNAME:</b>\n"
+            f"<i>Login username for the panel</i>\n\n"
+            f"❌ /cancel to cancel")
         return
 
     # ============ USER PANEL NAVIGATION ============
@@ -8483,14 +8509,13 @@ if __name__ == "__main__":
                             app_name = sess.get("app", "?")
                             try:
                                 bot.send_message(user_id,
-                                    f"━━━━━━━━━━━━━━━\n"
-                                    f"《 ✅ <b>OTP RECEIVED!</b> 》\n"
-                                    f"━━━━━━━━━━━━━━━\n\n"
-                                    f"📱 <b>NUMBER:</b> <code>{number}</code>\n"
-                                    f"🔑 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n"
-                                    f"💰 <b>EARNED:</b> ${price:.4f}\n"
-                                    f"━━━━━━━━━━━━━━━\n"
-                                    f"✅ <b>Auto-detected!</b>",
+                                    f"━━━━━━━━━━━━━━\n"
+                                    f"《 📱 <b>NEW SMS RECEIVED</b> 》\n"
+                                    f"━━━━━━━━━━━━━━\n\n"
+                                    f"📞 <b>Number:</b> <code>{number}</code>\n"
+                                    f"🔑 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n\n"
+                                    f"✅ <b>Auto-detected via MySmsPortal!</b>\n"
+                                    f"━━━━━━━━━━━━━━",
                                     parse_mode="HTML")
                             except Exception as e:
                                 log(f"[OTP SCANNER] Notify failed: {e}")
