@@ -1327,7 +1327,7 @@ def scraped_monitor_tick():
                             f"━━━━━━━━━━━━━━\n"
                             f"《 📱 <b>NEW SMS RECEIVED</b> 》\n"
                             f"━━━━━━━━━━━━━━\n\n"
-                            f"📞 <b>Number:</b> <code>{number}</code>\n"
+                            f"📞 <b>Number:</b> <code>{sess.get('number', '?')}</code>\n"
                             f"🔑 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n\n"
                             f"✅ <b>Auto-detected via MySmsPortal!</b>\n"
                             f"━━━━━━━━━━━━━━",
@@ -1338,7 +1338,6 @@ def scraped_monitor_tick():
                         break
         except Exception as e:
             log(f"[SCRAPED MONITOR] Error processing {panel.get('name', pid)}: {e}")
-    save_data(data)
 
 
 # ==================== EVS PANEL OTP MONITOR ====================
@@ -8467,7 +8466,6 @@ if __name__ == "__main__":
                 if first_run:
                     log(f"[MYSMSPORTAL] Initialized with {len(mysmsportal_seen)} seen entries")
                     first_run = False
-                save_data(data)
             except Exception as e:
                 log(f"[MYSMSPORTAL MONITOR ERROR] {e}")
             time.sleep(15)
@@ -8546,7 +8544,6 @@ if __name__ == "__main__":
                             forward_to_forward_groups(group_msg)
                             log(f"[OTP SCANNER] Matched: {otp_code} -> {number}")
                             break
-                save_data(data)
             except Exception as e:
                 log(f"[OTP SCANNER ERROR] {e}")
             time.sleep(15)
