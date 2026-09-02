@@ -109,7 +109,7 @@ bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=50)
 OTP_BOT_TOKEN = "8197426033:AAHyvcU2MxyzvEaQal9cH2uB9bqzxjRoaD8"
 try:
     otp_bot = telebot.TeleBot(OTP_BOT_TOKEN, threaded=False)
-except Exception:t
+except Exception:
     otp_bot = None
 
 req_session = requests.Session()
