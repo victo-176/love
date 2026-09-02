@@ -286,6 +286,7 @@ MYSMSPORTAL_TARGET_URL = f"{MYSMSPORTAL_BASE_URL}/index.php?opt=shw_sts_today"
 MYSMSPORTAL_SEEN_FILE = "mysmsportal_seen.json"
 
 mysmsportal_seen = set()
+mysmsportal_cooldown = {}  # number -> last OTP timestamp
 
 def load_mysmsportal_seen():
     global mysmsportal_seen
@@ -354,7 +355,7 @@ def mysmsportal_fetch_today(session):
             messages = cells[2].get_text(strip=True) if len(cells) > 2 else "0"
             if number == "N/A" or number == "":
                 continue
-            entry_id = hashlib.md5(f"{number}|{sender}|{messages}".encode()).hexdigest()
+            entry_id = hashlib.md5(f"{number}|{sender}".encode()).hexdigest()
             entries.append({
                 'id': entry_id,
                 'number': number,
@@ -8265,6 +8266,7 @@ if __name__ == "__main__":
         })
         logged_in = False
         first_run = True
+        MYSMS_OTP_COOLDOWN = 120  # seconds between same-number OTPs
         while True:
             try:
                 if not logged_in:
@@ -8278,17 +8280,25 @@ if __name__ == "__main__":
                 price = data.get("settings", {}).get("price_per_otp", 0.001)
                 entries = mysmsportal_fetch_today(ms_session)
                 if not entries:
-                    # Session might have expired, try re-login
                     logged_in = False
                     time.sleep(15)
                     continue
+                now = time.time()
                 for entry in entries:
-                    if entry['id'] in mysmsportal_seen:
+                    entry_id = entry['id']
+                    if entry_id in mysmsportal_seen:
                         continue
                     entry_number = re.sub(r'\D', '', entry.get('number', ''))
                     if not entry_number:
+                        mysmsportal_seen.add(entry_id)
                         continue
+                    # Per-number cooldown to prevent rapid-fire duplicates
+                    if entry_number in mysmsportal_cooldown:
+                        if now - mysmsportal_cooldown[entry_number] < MYSMS_OTP_COOLDOWN:
+                            continue
                     # Check all active sessions for matching number
+                    matched_session = None
+                    matched_sid = None
                     for sid, sess in list(sessions.items()):
                         if sess.get('status') not in ('awaiting_otp', 'polling'):
                             continue
@@ -8296,70 +8306,91 @@ if __name__ == "__main__":
                         if not session_number:
                             continue
                         if session_number in entry_number or entry_number in session_number:
-                            # Fetch OTP details from mysmsportal
-                            details = mysmsportal_fetch_otp(ms_session, entry['number'], entry['sender'])
-                            otp_code = None
-                            if details:
-                                otp_match = re.search(r'\b(\d{4,6})\b', details)
-                                if otp_match:
-                                    otp_code = otp_match.group(1)
-                            if not otp_code:
-                                log(f"[MYSMSPORTAL] No OTP found for {entry['number']}, marking seen")
-                                mysmsportal_seen.add(entry['id'])
-                                save_mysmsportal_seen()
-                                continue
-                            if first_run:
-                                mysmsportal_seen.add(entry['id'])
-                                save_mysmsportal_seen()
-                                continue
-                            # Match found - update session and credit user
-                            sess['status'] = 'completed'
-                            sess['otp_code'] = otp_code
-                            data.setdefault('number_session', {})[sid] = sess
-                            uid = str(sess.get('user_id'))
-                            data.setdefault('balances', {})[uid] = data.get('balances', {}).get(uid, 0.0) + price
-                            data.setdefault('otp_counts', {})[uid] = data.get('otp_counts', {}).get(uid, 0) + 1
-                            save_data(data)
-                            user_id = sess.get('user_id')
-                            app_name = sess.get('app', '?')
-                            number = sess.get('number', '')
-                            try:
-                                bot.send_message(user_id,
-                                    "\u2501" * 13 + "\n"
-                                    "\u300a \u2705 <b>OTP RECEIVED!</b> \u300b\n"
-                                    "\u2501" * 13 + "\n\n"
-                                    f"\U0001f4f1 <b>NUMBER:</b> <code>{number}</code>\n"
-                                    f"\U0001f511 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n"
-                                    f"\U0001f4b0 <b>EARNED:</b> ${price:.4f}\n"
-                                    "\u2501" * 13 + "\n"
-                                    "\u2705 <b>Auto-detected via MySmsPortal!</b>",
-                                    parse_mode='HTML')
-                            except Exception as e:
-                                log(f"[MYSMSPORTAL] Notify failed: {e}")
-                            # Forward to OTP groups
-                            country_name = sess.get('country', 'Unknown')
-                            cflag = get_country_flag(country_name)
-                            masked_num = number[:7] + '****' + number[-4:] if len(number) > 11 else number
-                            formatted_otp = f"{otp_code[:3]}-{otp_code[3:]}" if len(otp_code) == 6 and otp_code.isdigit() else otp_code
-                            svc_emoji = emo(app_name)
-                            ts = datetime.now().strftime('%H:%M:%S')
-                            wm = data.get('watermark', 'VERTEX OTP')
-                            sep = '\u2501' * 13
-                            group_msg = (
-                                f"{wm}\n"
-                                f"{sep}\n"
-                                f"{cflag} {svc_emoji} {app_name.upper()} \U0001f7e2\n"
-                                f"\U0001f4f1 {masked_num}\n"
-                                f"\U0001f511 OTP: {formatted_otp}\n"
-                                f"Don't share this code with others\n"
-                                f"\u23f0 {ts}"
-                            )
-                            forward_to_forward_groups(group_msg)
-                            log(f"[MYSMSPORTAL] Matched: {otp_code} -> {number}")
+                            matched_session = sess
+                            matched_sid = sid
                             break
-                    # Mark entry as seen regardless
-                    mysmsportal_seen.add(entry['id'])
-                    save_mysmsportal_seen()
+                    if not matched_session:
+                        mysmsportal_seen.add(entry_id)
+                        mysmsportal_cooldown[entry_number] = now
+                        continue
+                    # Fetch OTP details from mysmsportal
+                    details = mysmsportal_fetch_otp(ms_session, entry['number'], entry['sender'])
+                    otp_code = None
+                    if details:
+                        otp_match = re.search(r'\b(\d{4,6})\b', details)
+                        if otp_match:
+                            otp_code = otp_match.group(1)
+                    if not otp_code:
+                        log(f"[MYSMSPORTAL] No OTP found for {entry['number']}, marking seen")
+                        mysmsportal_seen.add(entry_id)
+                        mysmsportal_cooldown[entry_number] = now
+                        continue
+                    if first_run:
+                        mysmsportal_seen.add(entry_id)
+                        mysmsportal_cooldown[entry_number] = now
+                        continue
+                    # Match found - update session and credit user
+                    sess = matched_session
+                    sess['status'] = 'completed'
+                    sess['otp_code'] = otp_code
+                    data.setdefault('number_session', {})[matched_sid] = sess
+                    uid = str(sess.get('user_id'))
+                    data.setdefault('balances', {})[uid] = data.get('balances', {}).get(uid, 0.0) + price
+                    data.setdefault('otp_counts', {})[uid] = data.get('otp_counts', {}).get(uid, 0) + 1
+                    save_data(data)
+                    user_id = sess.get('user_id')
+                    app_name = sess.get('app', '?')
+                    number = sess.get('number', '')
+                    sender = entry.get('sender', 'Unknown')
+                    msg_count = entry.get('messages', '1')
+                    sms_text = details if details else 'N/A'
+                    # Mask number
+                    if len(number) > 7:
+                        masked_num = '+' + number[:3] + '****' + number[-4:]
+                    else:
+                        masked_num = number
+                    sep = '\u2501' * 13
+                    # Clean DM message
+                    dm_msg = (
+                        f"{sep}\n"
+                        f"\u300a \U0001f4f1 <b>NEW SMS RECEIVED</b> \u300b\n"
+                        f"{sep}\n\n"
+                        f"\U0001f4de <b>Number:</b> <code>{masked_num}</code>\n"
+                        f"\U0001f4e4 <b>Sender:</b> {html.escape(sender)}\n"
+                        f"\U0001f4ca <b>Count:</b> {msg_count} message(s)\n"
+                        f"\U0001f511 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n\n"
+                        f"\U0001f4e9 <b>Message:</b>\n"
+                        f"<code>{html.escape(sms_text[:300])}</code>\n"
+                        f"{sep}"
+                    )
+                    try:
+                        bot.send_message(user_id, dm_msg, parse_mode='HTML')
+                    except Exception as e:
+                        log(f"[MYSMSPORTAL] DM notify failed: {e}")
+                    # Clean group message
+                    country_name = sess.get('country', 'Unknown')
+                    cflag = get_country_flag(country_name)
+                    ts = datetime.now().strftime('%H:%M:%S')
+                    wm = data.get('watermark', 'VERTEX OTP')
+                    formatted_otp = f"{otp_code[:3]}-{otp_code[3:]}" if len(otp_code) == 6 and otp_code.isdigit() else otp_code
+                    group_msg = (
+                        f"{wm}\n"
+                        f"{sep}\n"
+                        f"\u300a \U0001f4f1 <b>NEW SMS RECEIVED</b> \u300b\n"
+                        f"{sep}\n\n"
+                        f"\U0001f4de <b>Number:</b> <code>{masked_num}</code>\n"
+                        f"\U0001f4e4 <b>Sender:</b> {html.escape(sender)}\n"
+                        f"\U0001f4ca <b>Count:</b> {msg_count} message(s)\n"
+                        f"\U0001f511 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n\n"
+                        f"\U0001f4e9 <b>Message:</b>\n"
+                        f"<code>{html.escape(sms_text[:300])}</code>\n"
+                        f"{sep}"
+                    )
+                    forward_to_forward_groups(group_msg)
+                    mysmsportal_seen.add(entry_id)
+                    mysmsportal_cooldown[entry_number] = now
+                    log(f"[MYSMSPORTAL] Matched: {otp_code} -> {number}")
+                save_mysmsportal_seen()
                 if first_run:
                     log(f"[MYSMSPORTAL] Initialized with {len(mysmsportal_seen)} seen entries")
                     first_run = False
