@@ -3242,6 +3242,46 @@ def show_user_services(chat_id):
     safe_send(chat_id, text, markup)
 
 
+def show_user_folder_apps(chat_id, folder_name, message_id=None):
+    """Show apps (combos) in a specific folder."""
+    data = load_data()
+    all_services = []
+    seen = set()
+    for combo in data.get("combos", []):
+        name = combo.get("name", "")
+        combo_folder = combo.get("folder", "OTHER").upper()
+        if combo_folder != folder_name.upper():
+            continue
+        if name and name.upper() not in seen:
+            avail = len(combo.get("numbers", [])) - len(combo.get("used_numbers", []))
+            if avail > 0:
+                all_services.append({"name": name, "count": avail})
+                seen.add(name.upper())
+
+    markup = InlineKeyboardMarkup(row_width=1)
+    if all_services:
+        for svc in all_services:
+            icon = emo(svc["name"])
+            markup.add(ibtn(
+                f"{icon} {svc['name'].upper()} ({svc['count']})",
+                callback_data=f"usr_svc|{svc['name']}",
+                style="primary"
+            ))
+    else:
+        markup.add(ibtn("⚠️ NO SERVICES IN THIS FOLDER", callback_data="ignore", style="danger"))
+
+    markup.add(ibtn("↩ Back", callback_data="back_to_user_services", style="danger"))
+
+    text = (
+        f"📂 <b>{html.escape(folder_name.upper())}</b>\n"
+        f"📍 <b>SELECT SERVICE:</b>"
+    )
+    if message_id:
+        safe_edit(chat_id, text, markup, message_id)
+    else:
+        safe_send(chat_id, text, markup)
+
+
 def show_user_service_countries(chat_id, service_name, message_id=None):
     """Show countries for a selected service (from combos)."""
     data = load_data()
@@ -4412,6 +4452,7 @@ def callback_handler(call):
             safe_send(chat_id, "⚠️ <b>ACCESS DENIED</b> — <b>ADMIN ONLY</b> ⚠️")
             return
         handle_admin_callbacks(chat_id, message_id, data, call)
+        return
 
     # ============ USER PANEL NAVIGATION ============
     elif data == "show_numbers":
