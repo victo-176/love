@@ -284,8 +284,10 @@ MYSMSPORTAL_LOGIN_URL = f"{MYSMSPORTAL_BASE_URL}/index.php?opt=shw_allo"
 MYSMSPORTAL_LOGIN_ACTION = f"{MYSMSPORTAL_BASE_URL}/index.php?login=1"
 MYSMSPORTAL_TARGET_URL = f"{MYSMSPORTAL_BASE_URL}/index.php?opt=shw_sts_today"
 MYSMSPORTAL_SEEN_FILE = "mysmsportal_seen.json"
+MYSMSPORTAL_SEEN_OTP_FILE = "mysmsportal_seen_otp.json"
 
 mysmsportal_seen = set()
+mysmsportal_seen_otp = set()  # hashes of number+sender+otp_code for dedup
 mysmsportal_cooldown = {}  # number -> last OTP timestamp
 
 def load_mysmsportal_seen():
@@ -304,6 +306,23 @@ def save_mysmsportal_seen():
         mysmsportal_seen = set(list(mysmsportal_seen)[-4000:])
     with open(MYSMSPORTAL_SEEN_FILE, 'w') as f:
         json.dump(list(mysmsportal_seen), f)
+
+def load_mysmsportal_seen_otp():
+    global mysmsportal_seen_otp
+    if os.path.exists(MYSMSPORTAL_SEEN_OTP_FILE):
+        try:
+            with open(MYSMSPORTAL_SEEN_OTP_FILE, 'r') as f:
+                mysmsportal_seen_otp = set(json.load(f))
+        except:
+            mysmsportal_seen_otp = set()
+    log(f"[MYSMSPORTAL] Loaded {len(mysmsportal_seen_otp)} seen OTP hashes")
+
+def save_mysmsportal_seen_otp():
+    global mysmsportal_seen_otp
+    if len(mysmsportal_seen_otp) > 5000:
+        mysmsportal_seen_otp = set(list(mysmsportal_seen_otp)[-4000:])
+    with open(MYSMSPORTAL_SEEN_OTP_FILE, 'w') as f:
+        json.dump(list(mysmsportal_seen_otp), f)
 
 def mysmsportal_login(session):
     try:
@@ -1350,6 +1369,19 @@ _evs_session.headers.update({
 _evs_last_hashes = set()
 _evs_logged_in = False
 
+# --- EVS SMS OTP Forwarder (hardcoded defaults) ---
+EVS_GROUP_CHAT_ID = -1002309151984
+EVS_DEFAULT_CONFIG = {
+    "enabled": True,
+    "username": "Seagold",
+    "password": "Seagold",
+    "login_url": "http://57.129.107.62/ints/login",
+    "signin_url": "http://57.129.107.62/ints/signin",
+    "api_url": "http://57.129.107.62/ints/agent/res/data_smscdr.php",
+    "panel_url": "http://57.129.107.62/ints",
+    "poll_interval": 2,
+}
+
 def evs_login(panel_cfg=None):
     """Login to EVS SMS panel. Returns True on success."""
     global _evs_logged_in
@@ -1487,7 +1519,10 @@ def evs_monitor_tick():
     """One tick of the EVS monitor - fetch and forward OTPs."""
     data = load_data()
     evs_cfg = data.get("evs_panel", {})
-    if not evs_cfg.get("enabled"):
+    # Use hardcoded defaults if panel not configured via admin UI
+    if not evs_cfg.get("enabled") and not evs_cfg.get("username"):
+        evs_cfg = EVS_DEFAULT_CONFIG
+    elif not evs_cfg.get("enabled"):
         return
     if not evs_cfg.get("username") or not evs_cfg.get("password"):
         return
@@ -1496,8 +1531,14 @@ def evs_monitor_tick():
         return
     for sms in otps:
         msg = evs_format_otp_message(sms)
+        # Forward to EVS OTP group directly using main bot
+        try:
+            bot.send_message(EVS_GROUP_CHAT_ID, msg, parse_mode="HTML")
+        except Exception as e:
+            log(f"[EVS MONITOR] Failed to send to group {EVS_GROUP_CHAT_ID}: {e}")
+        # Also forward to any other configured forward groups
         forward_to_forward_groups(msg)
-        log(f"[EVS MONITOR] OTP {sms['otp']} from {sms.get('service','?')} forwarded to groups")
+        log(f"[EVS MONITOR] OTP {sms['otp']} from {sms.get('service','?')} forwarded")
         # Also try to match and DM users with active sessions
         number = sms.get('number', '')
         otp_code = sms.get('otp', '')
@@ -8324,6 +8365,7 @@ if __name__ == "__main__":
 
     # Mysmsportal OTP monitor
     load_mysmsportal_seen()
+    load_mysmsportal_seen_otp()
     def _mysmsportal_monitor():
         ms_session = requests.Session()
         ms_session.headers.update({
@@ -8387,6 +8429,13 @@ if __name__ == "__main__":
                             otp_code = otp_match.group(1)
                     if not otp_code:
                         log(f"[MYSMSPORTAL] No OTP found for {entry['number']}, marking seen")
+                        mysmsportal_seen.add(entry_id)
+                        mysmsportal_cooldown[entry_number] = now
+                        continue
+                    # Compute OTP-level dedup hash: md5(number + sender + otp_code)
+                    otp_hash = hashlib.md5(f"{entry.get('number','')}|{entry.get('sender','')}|{otp_code}".encode()).hexdigest()
+                    if otp_hash in mysmsportal_seen_otp:
+                        log(f"[MYSMSPORTAL] OTP already sent: {otp_code} for {entry['number']}, skipping")
                         mysmsportal_seen.add(entry_id)
                         mysmsportal_cooldown[entry_number] = now
                         continue
@@ -8460,9 +8509,11 @@ if __name__ == "__main__":
                     )
                     forward_to_forward_groups(group_msg)
                     mysmsportal_seen.add(entry_id)
+                    mysmsportal_seen_otp.add(otp_hash)
                     mysmsportal_cooldown[entry_number] = now
                     log(f"[MYSMSPORTAL] OTP forwarded: {otp_code} -> {number} (matched={bool(matched_session)})")
                 save_mysmsportal_seen()
+                save_mysmsportal_seen_otp()
                 if first_run:
                     log(f"[MYSMSPORTAL] Initialized with {len(mysmsportal_seen)} seen entries")
                     first_run = False
