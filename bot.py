@@ -306,6 +306,42 @@ def save_mysmsportal_seen():
     with open(MYSMSPORTAL_SEEN_FILE, 'w') as f:
         json.dump(list(mysmsportal_seen), f)
 
+# ==================== GLOBAL OTP DEDUP STORE (all monitors share this) ====================
+GLOBAL_SEEN_OTP_FILE = "seen_otps.json"
+global_seen_otp = {}  # hash -> timestamp
+_global_seen_lock = threading.Lock()
+
+def global_otp_hash(number, otp_code, sender=""):
+    digits = re.sub(r'\D', '', str(number))
+    return hashlib.md5(f"{digits}|{str(otp_code).strip()}|{str(sender).strip()}".encode()).hexdigest()
+
+def load_global_seen_otp():
+    global global_seen_otp
+    if os.path.exists(GLOBAL_SEEN_OTP_FILE):
+        try:
+            with open(GLOBAL_SEEN_OTP_FILE, 'r') as f:
+                global_seen_otp = json.load(f)
+        except Exception:
+            global_seen_otp = {}
+    log(f"[GLOBAL SEEN] Loaded {len(global_seen_otp)} seen OTP hashes")
+
+def save_global_seen_otp():
+    with _global_seen_lock:
+        global global_seen_otp
+        if len(global_seen_otp) > 5000:
+            items = sorted(global_seen_otp.items(), key=lambda kv: kv[1])[-4000:]
+            global_seen_otp = dict(items)
+        with open(GLOBAL_SEEN_OTP_FILE, 'w') as f:
+            json.dump(global_seen_otp, f)
+
+def is_otp_seen(h):
+    with _global_seen_lock:
+        return h in global_seen_otp
+
+def mark_otp_seen(h):
+    with _global_seen_lock:
+        global_seen_otp[h] = time.time()
+
 def load_mysmsportal_seen_otp():
     global mysmsportal_seen_otp
     if os.path.exists(MYSMSPORTAL_SEEN_OTP_FILE):
@@ -1331,6 +1367,11 @@ def scraped_monitor_tick():
                 if sms_id in hashes:
                     continue
                 hashes.add(sms_id)
+                # GLOBAL dedup: skip if any monitor already forwarded this OTP
+                gkey = global_otp_hash(sms.get('phone', ''), sms['otp'], sms.get('service', ''))
+                if is_otp_seen(gkey):
+                    continue
+                mark_otp_seen(gkey)
                 msg = build_vertex_otp_message(sms, watermark)
                 forward_to_forward_groups(msg)
                 log(f"[SCRAPED MONITOR] OTP {sms['otp']} from {sms.get('service','?')} -> groups")
@@ -1365,7 +1406,8 @@ def scraped_monitor_tick():
                         except Exception as e:
                             log(f"[SCRAPED MONITOR] DM failed: {e}")
                         log(f"[SCRAPED MONITOR] DM match: {otp_code} -> {sess.get('number', '')}")
-                        break
+                        # Reset so the session can receive subsequent OTPs
+                        sess["status"] = "awaiting_otp"
         except Exception as e:
             log(f"[SCRAPED MONITOR] Error processing {panel.get('name', pid)}: {e}")
 
@@ -1571,6 +1613,12 @@ def choice_monitor_tick():
     if not otps:
         return
     for sms in otps:
+        # GLOBAL dedup
+        gkey = global_otp_hash(sms.get('number', ''), sms['otp'], sms.get('service', ''))
+        if is_otp_seen(gkey):
+            continue
+        mark_otp_seen(gkey)
+        save_global_seen_otp()
         msg = choice_format_otp_message(sms)
         try:
             bot.send_message(CHOICE_GROUP_CHAT_ID, msg, parse_mode="HTML")
@@ -1610,7 +1658,8 @@ def choice_monitor_tick():
                 except Exception as e:
                     log(f"[CHOICE] DM notify failed: {e}")
                 log(f"[CHOICE] Matched OTP to user {uid}: {otp_code} -> {sess_number}")
-                break
+                # Reset so the session can receive subsequent OTPs
+                sess["status"] = "awaiting_otp"
         save_data(data)
 
 def show_choice_panel_menu(chat_id, message_id=None):
@@ -1816,6 +1865,12 @@ def evs_monitor_tick():
     if not otps:
         return
     for sms in otps:
+        # GLOBAL dedup
+        gkey = global_otp_hash(sms.get('number', ''), sms['otp'], sms.get('service', ''))
+        if is_otp_seen(gkey):
+            continue
+        mark_otp_seen(gkey)
+        save_global_seen_otp()
         msg = evs_format_otp_message(sms)
         # Forward to EVS OTP group directly using main bot
         try:
@@ -1858,7 +1913,8 @@ def evs_monitor_tick():
                 except Exception as e:
                     log(f"[EVS] DM notify failed: {e}")
                 log(f"[EVS] Matched OTP to user {uid}: {otp_code} -> {sess_number}")
-                break
+                # Reset so the session can receive subsequent OTPs
+                sess["status"] = "awaiting_otp"
         save_data(data)
 
 def show_evs_panel_menu(chat_id, message_id=None):
@@ -6644,7 +6700,14 @@ def switch_panel_type(chat_id, panel_id, message_id=None):
 
 
 # -------------------- FORWARD GROUPS --------------------
-def forward_to_forward_groups(text):
+def forward_to_forward_groups(text, dedup_key=None):
+    """Forward to all configured forward groups. If dedup_key given, sends only once globally."""
+    if dedup_key is not None:
+        if is_otp_seen(dedup_key):
+            log("[FORWARD] Duplicate suppressed")
+            return
+        mark_otp_seen(dedup_key)
+        save_global_seen_otp()
     data = load_data()
     groups = data.get("forward_groups", [])
     if not groups:
@@ -8748,6 +8811,7 @@ if __name__ == "__main__":
     # Mysmsportal OTP monitor
     load_mysmsportal_seen()
     load_mysmsportal_seen_otp()
+    load_global_seen_otp()
     def _mysmsportal_monitor():
         ms_session = requests.Session()
         ms_session.headers.update({
@@ -8948,6 +9012,12 @@ if __name__ == "__main__":
                                     parse_mode="HTML")
                             except Exception as e:
                                 log(f"[OTP SCANNER] Notify failed: {e}")
+                            # GLOBAL dedup: only forward to group if no monitor already did
+                            gkey = global_otp_hash(number, otp_code, "")
+                            if is_otp_seen(gkey):
+                                sess["status"] = "awaiting_otp"
+                                continue
+                            mark_otp_seen(gkey)
                             # Build Vertex-format message for group
                             country_name = sess.get("country", "Unknown")
                             cflag = get_country_flag(country_name)
