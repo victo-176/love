@@ -1347,15 +1347,13 @@ _scraped_monitor_hashes = {}
 
 # ADDED: scraped_monitor_tick - forwards OTPs to groups + DMs active sessions
 def scraped_monitor_tick():
-    """Check all active scraped panels, forward OTPs to groups + DM matching users."""
+    """Check all active scraped panels, forward OTPs via central processor (dedup + DM)."""
     data = load_data()
     watermark = data.get("watermark", "EARNINGWITHSIMPLETASK")
-    price = data.get("settings", {}).get("price_per_otp", 0.001)
     scraped_panels = {pid: p for pid, p in data.get("panels", {}).items()
                       if p.get("status") == "active" and p.get("type") == "scraped"}
     if not scraped_panels:
         return
-    sessions = data.get("number_session", {})
     for pid, panel in scraped_panels.items():
         try:
             otps = scraped_fetch_otps(pid)
@@ -1367,47 +1365,8 @@ def scraped_monitor_tick():
                 if sms_id in hashes:
                     continue
                 hashes.add(sms_id)
-                # GLOBAL dedup: skip if any monitor already forwarded this OTP
-                gkey = global_otp_hash(sms.get('phone', ''), sms['otp'], sms.get('service', ''))
-                if is_otp_seen(gkey):
-                    continue
-                mark_otp_seen(gkey)
-                msg = build_vertex_otp_message(sms, watermark)
-                forward_to_forward_groups(msg)
-                log(f"[SCRAPED MONITOR] OTP {sms['otp']} from {sms.get('service','?')} -> groups")
-                # ADDED: DM delivery to matching user sessions
-                sms_phone = re.sub(r'\D', '', sms.get('phone', ''))
-                for sid, sess in list(sessions.items()):
-                    if sess.get("status") not in ("awaiting_otp", "polling"):
-                        continue
-                    num_clean = re.sub(r'\D', '', sess.get("number", ""))
-                    if num_clean and (num_clean in sms_phone or sms_phone in num_clean):
-                        otp_code = sms.get("otp", "")
-                        if not otp_code:
-                            continue
-                        sess["status"] = "completed"
-                        sess["otp_code"] = otp_code
-                        data.setdefault("number_session", {})[sid] = sess
-                        uid = str(sess.get("user_id"))
-                        data.setdefault("balances", {})[uid] = data.get("balances", {}).get(uid, 0.0) + price
-                        data.setdefault("otp_counts", {})[uid] = data.get("otp_counts", {}).get(uid, 0) + 1
-                        save_data(data)
-                        user_id = sess.get("user_id")
-                        try:
-                            bot.send_message(user_id,
-                            f"━━━━━━━━━━━━━━\n"
-                            f"《 📱 <b>NEW SMS RECEIVED</b> 》\n"
-                            f"━━━━━━━━━━━━━━\n\n"
-                            f"📞 <b>Number:</b> <code>{sess.get('number', '?')}</code>\n"
-                            f"🔑 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n\n"
-                            f"✅ <b>Auto-detected via MySmsPortal!</b>\n"
-                            f"━━━━━━━━━━━━━━",
-                            parse_mode="HTML")
-                        except Exception as e:
-                            log(f"[SCRAPED MONITOR] DM failed: {e}")
-                        log(f"[SCRAPED MONITOR] DM match: {otp_code} -> {sess.get('number', '')}")
-                        # Reset so the session can receive subsequent OTPs
-                        sess["status"] = "awaiting_otp"
+                sms['_formatter'] = lambda s, _wm=watermark: build_vertex_otp_message(s, _wm)
+                process_otp(sms, "Scraped Panel")
         except Exception as e:
             log(f"[SCRAPED MONITOR] Error processing {panel.get('name', pid)}: {e}")
 
@@ -1552,7 +1511,9 @@ def choice_fetch_otps(panel_cfg=None):
                     otp_match = re.search(r'\b(\d{4,6})\b', full_text)
                 if otp_match:
                     otp = otp_match.group(1)
-                    sms_id = hashlib.md5((otp + timestamp + service + number).encode()).hexdigest()
+                    # Dedup on number+otp+service WITHOUT timestamp (API timestamp
+                    # jitter created different hashes for the same OTP = 4x dupes)
+                    sms_id = hashlib.md5((number + otp + service).encode()).hexdigest()
                     if sms_id not in _choice_last_hashes:
                         _choice_last_hashes.add(sms_id)
                         otps.append({
@@ -1600,7 +1561,7 @@ def choice_format_otp_message(sms):
     )
 
 def choice_monitor_tick():
-    """One tick of the Choice SMS monitor - fetch and forward OTPs."""
+    """One tick of the Choice SMS monitor - fetch OTPs and push through central processor."""
     data = load_data()
     choice_cfg = data.get("choice_panel", {})
     if not choice_cfg:
@@ -1613,54 +1574,8 @@ def choice_monitor_tick():
     if not otps:
         return
     for sms in otps:
-        # GLOBAL dedup
-        gkey = global_otp_hash(sms.get('number', ''), sms['otp'], sms.get('service', ''))
-        if is_otp_seen(gkey):
-            continue
-        mark_otp_seen(gkey)
-        save_global_seen_otp()
-        msg = choice_format_otp_message(sms)
-        try:
-            bot.send_message(CHOICE_GROUP_CHAT_ID, msg, parse_mode="HTML")
-        except Exception as e:
-            log(f"[CHOICE MONITOR] Failed to send to group {CHOICE_GROUP_CHAT_ID}: {e}")
-        forward_to_forward_groups(msg)
-        log(f"[CHOICE MONITOR] OTP {sms['otp']} from {sms.get('service','?')} forwarded")
-        # Match and DM users with active sessions
-        number = sms.get('number', '')
-        otp_code = sms.get('otp', '')
-        sessions = data.get("number_session", {})
-        price = data.get("settings", {}).get("price_per_otp", 0.001)
-        for sid, sess in list(sessions.items()):
-            if sess.get("status") not in ("awaiting_otp", "polling"):
-                continue
-            sess_number = sess.get("number", "")
-            num_clean = re.sub(r'\D', '', number)
-            sess_clean = re.sub(r'\D', '', sess_number)
-            if sess_clean and num_clean and (sess_clean in num_clean or num_clean in sess_clean):
-                sess["status"] = "completed"
-                sess["otp_code"] = otp_code
-                data.setdefault("number_session", {})[sid] = sess
-                user_id = sess.get("user_id")
-                uid = str(user_id)
-                data.setdefault("balances", {})[uid] = data.get("balances", {}).get(uid, 0.0) + price
-                data.setdefault("otp_counts", {})[uid] = data.get("otp_counts", {}).get(uid, 0) + 1
-                try:
-                    bot.send_message(user_id,
-                    f"━━━━━━━━━━━━━━\n"
-                    f"《 📱 <b>NEW SMS RECEIVED</b> 》\n"
-                    f"━━━━━━━━━━━━━━\n\n"
-                    f"📞 <b>Number:</b> <code>{sess_number}</code>\n"
-                    f"🔑 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n\n"
-                    f"✅ <b>Auto-detected via Choice SMS!</b>\n"
-                    f"━━━━━━━━━━━━━━",
-                    parse_mode="HTML")
-                except Exception as e:
-                    log(f"[CHOICE] DM notify failed: {e}")
-                log(f"[CHOICE] Matched OTP to user {uid}: {otp_code} -> {sess_number}")
-                # Reset so the session can receive subsequent OTPs
-                sess["status"] = "awaiting_otp"
-        save_data(data)
+        sms['_formatter'] = choice_format_otp_message
+        process_otp(sms, "Choice SMS")
 
 def show_choice_panel_menu(chat_id, message_id=None):
     """Show Choice SMS panel admin menu."""
@@ -1851,10 +1766,9 @@ def evs_format_otp_message(sms):
     )
 
 def evs_monitor_tick():
-    """One tick of the EVS monitor - fetch and forward OTPs."""
+    """One tick of the EVS monitor - fetch OTPs and push through central processor."""
     data = load_data()
     evs_cfg = data.get("evs_panel", {})
-    # Use hardcoded defaults if panel not configured via admin UI
     if not evs_cfg.get("enabled") and not evs_cfg.get("username"):
         evs_cfg = EVS_DEFAULT_CONFIG
     elif not evs_cfg.get("enabled"):
@@ -1865,57 +1779,8 @@ def evs_monitor_tick():
     if not otps:
         return
     for sms in otps:
-        # GLOBAL dedup
-        gkey = global_otp_hash(sms.get('number', ''), sms['otp'], sms.get('service', ''))
-        if is_otp_seen(gkey):
-            continue
-        mark_otp_seen(gkey)
-        save_global_seen_otp()
-        msg = evs_format_otp_message(sms)
-        # Forward to EVS OTP group directly using main bot
-        try:
-            bot.send_message(EVS_GROUP_CHAT_ID, msg, parse_mode="HTML")
-        except Exception as e:
-            log(f"[EVS MONITOR] Failed to send to group {EVS_GROUP_CHAT_ID}: {e}")
-        # Also forward to any other configured forward groups
-        forward_to_forward_groups(msg)
-        log(f"[EVS MONITOR] OTP {sms['otp']} from {sms.get('service','?')} forwarded")
-        # Also try to match and DM users with active sessions
-        number = sms.get('number', '')
-        otp_code = sms.get('otp', '')
-        sessions = data.get("number_session", {})
-        for sid, sess in list(sessions.items()):
-            if sess.get("status") not in ("awaiting_otp", "polling"):
-                continue
-            sess_number = sess.get("number", "")
-            num_clean = re.sub(r'\D', '', number)
-            sess_clean = re.sub(r'\D', '', sess_number)
-            if sess_clean and (sess_clean in num_clean or num_clean in sess_clean):
-                sess["status"] = "completed"
-                sess["otp_code"] = otp_code
-                data.setdefault("number_session", {})[sid] = sess
-                user_id = sess.get("user_id")
-                app_name = sess.get("app", "?")
-                price = data.get("settings", {}).get("price_per_otp", 0.001)
-                uid = str(user_id)
-                data.setdefault("balances", {})[uid] = data.get("balances", {}).get(uid, 0.0) + price
-                data.setdefault("otp_counts", {})[uid] = data.get("otp_counts", {}).get(uid, 0) + 1
-                try:
-                    bot.send_message(user_id,
-                    f"━━━━━━━━━━━━━━\n"
-                    f"《 📱 <b>NEW SMS RECEIVED</b> 》\n"
-                    f"━━━━━━━━━━━━━━\n\n"
-                    f"📞 <b>Number:</b> <code>{sess_number}</code>\n"
-                    f"🔑 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n\n"
-                    f"✅ <b>Auto-detected via MySmsPortal!</b>\n"
-                    f"━━━━━━━━━━━━━━",
-                    parse_mode="HTML")
-                except Exception as e:
-                    log(f"[EVS] DM notify failed: {e}")
-                log(f"[EVS] Matched OTP to user {uid}: {otp_code} -> {sess_number}")
-                # Reset so the session can receive subsequent OTPs
-                sess["status"] = "awaiting_otp"
-        save_data(data)
+        sms['_formatter'] = evs_format_otp_message
+        process_otp(sms, "EVS")
 
 def show_evs_panel_menu(chat_id, message_id=None):
     """Show EVS panel admin menu."""
@@ -6700,6 +6565,87 @@ def switch_panel_type(chat_id, panel_id, message_id=None):
 
 
 # -------------------- FORWARD GROUPS --------------------
+# ==================== CENTRAL OTP PROCESSOR (dedup + group forward + DM all sessions) ====================
+def process_otp(sms, panel_name):
+    """Central OTP pipeline used by ALL monitors:
+    1. Global dedup (seen_otps.json) so an OTP reaches groups exactly once, ever.
+    2. Forward to all configured forward groups.
+    3. DM every active session matching the number (no break; session stays active).
+    Returns True if the OTP was new (forwarded), False if it was a duplicate."""
+    number = str(sms.get('number', '') or sms.get('phone', ''))
+    otp_code = str(sms.get('otp', ''))
+    service = str(sms.get('service', ''))
+    if not number or not otp_code:
+        return False
+    gkey = global_otp_hash(number, otp_code, service)
+    if is_otp_seen(gkey):
+        log(f"[{panel_name}] Duplicate OTP suppressed globally: {otp_code} -> {number}")
+        return False
+    mark_otp_seen(gkey)
+    save_global_seen_otp()
+    # Build group message from panel-specific formatter when available
+    fmt = sms.pop('_formatter', None)
+    if fmt:
+        msg = fmt(sms)
+    else:
+        sep = "\u2501" * 13
+        wm = load_data().get("watermark", "VERTEX OTP")
+        digits = re.sub(r'\D', '', number)
+        masked = ('+' + digits[:3] + '****' + digits[-4:]) if len(digits) > 7 else number
+        msg = (f"{wm}\n{sep}\n"
+               f"\u300a \U0001f4f1 <b>NEW SMS RECEIVED</b> \u300b\n{sep}\n\n"
+               f"\U0001f4de <b>Number:</b> <code>{masked}</code>\n"
+               f"\U0001f4e4 <b>Sender:</b> {html.escape(service or 'Unknown')}\n"
+               f"\U0001f511 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n"
+               f"{sep}")
+    forward_to_forward_groups(msg)
+    log(f"[{panel_name}] OTP forwarded once via central processor: {otp_code} -> {number}")
+    deliver_otp_dms(number, otp_code, panel_name)
+    return True
+
+def deliver_otp_dms(number, otp_code, panel_name):
+    """DM every active session whose number matches. NEVER breaks; resets status
+    to awaiting_otp so subsequent OTPs keep flowing to the same user."""
+    data = load_data()
+    price = data.get("settings", {}).get("price_per_otp", 0.001)
+    num_clean = re.sub(r'\D', '', number)
+    if not num_clean:
+        return
+    matched = 0
+    for sid, sess in list(data.get("number_session", {}).items()):
+        # Treat completed sessions as still eligible: only skip cancelled/expired
+        if sess.get("status") in ("cancelled", "expired", "timeout"):
+            continue
+        sess_number = str(sess.get("number", ""))
+        sess_clean = re.sub(r'\D', '', sess_number)
+        if not sess_clean or not (sess_clean in num_clean or num_clean in sess_clean):
+            continue
+        matched += 1
+        sess["status"] = "completed"
+        sess["otp_code"] = otp_code
+        data.setdefault("number_session", {})[sid] = sess
+        uid = str(sess.get("user_id"))
+        data.setdefault("balances", {})[uid] = data.get("balances", {}).get(uid, 0.0) + price
+        data.setdefault("otp_counts", {})[uid] = data.get("otp_counts", {}).get(uid, 0) + 1
+        sep = "\u2501" * 13
+        try:
+            bot.send_message(sess.get("user_id"),
+                f"{sep}\n"
+                f"\u300a \U0001f4f1 <b>NEW SMS RECEIVED</b> \u300b\n{sep}\n\n"
+                f"\U0001f4de <b>Number:</b> <code>{sess_number}</code>\n"
+                f"\U0001f511 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n\n"
+                f"\u2705 <b>Auto-detected via {panel_name}!</b>\n"
+                f"{sep}",
+                parse_mode="HTML")
+        except Exception as e:
+            log(f"[{panel_name}] DM notify failed: {e}")
+        # Reset so the session can receive subsequent OTPs
+        sess["status"] = "awaiting_otp"
+        log(f"[{panel_name}] DM delivered: {otp_code} -> {sess_number} (user {uid})")
+    if matched:
+        save_data(data)
+
+
 def forward_to_forward_groups(text, dedup_key=None):
     """Forward to all configured forward groups. If dedup_key given, sends only once globally."""
     if dedup_key is not None:
@@ -8964,82 +8910,79 @@ if __name__ == "__main__":
 
     # OTP auto-scan: check scraped panels for matching numbers
     def _otp_scanner():
+        """Generic scanner for scraped panels: DM matching sessions; forward to
+        groups only if no panel monitor already did (global dedup)."""
         while True:
             try:
                 data = load_data()
                 sessions = data.get("number_session", {})
                 price = data.get("settings", {}).get("price_per_otp", 0.001)
                 for sid, sess in list(sessions.items()):
-                    if sess.get("status") not in ("awaiting_otp", "polling"):
+                    if sess.get("status") in ("cancelled", "expired", "timeout"):
                         continue
                     number = sess.get("number", "")
                     panel_id = sess.get("panel_id", "")
-                    # Check this session's panel first
                     panel = data.get("panels", {}).get(panel_id, {})
                     otps = []
                     if panel.get("type") == "scraped":
                         otps = scraped_fetch_otps(panel_id)
                     else:
-                        # For combo numbers, check ALL scraped panels
                         for pid, p in data.get("panels", {}).items():
                             if p.get("type") == "scraped" and p.get("status") == "active":
                                 otps.extend(scraped_fetch_otps(pid))
                     for sms in otps:
                         sms_phone = re.sub(r'\D', '', sms.get("phone", ""))
                         num_clean = re.sub(r'\D', '', number)
-                        if num_clean and (num_clean in sms_phone or sms_phone in num_clean):
-                            otp_code = sms.get("otp", "")
-                            if not otp_code:
-                                continue
-                            sess["status"] = "completed"
-                            sess["otp_code"] = otp_code
-                            data.setdefault("number_session", {})[sid] = sess
-                            uid = str(sess.get("user_id"))
-                            data.setdefault("balances", {})[uid] = data.get("balances", {}).get(uid, 0.0) + price
-                            data.setdefault("otp_counts", {})[uid] = data.get("otp_counts", {}).get(uid, 0) + 1
-                            save_data(data)
-                            user_id = sess.get("user_id")
-                            app_name = sess.get("app", "?")
-                            try:
-                                bot.send_message(user_id,
-                                    f"━━━━━━━━━━━━━━\n"
-                                    f"《 📱 <b>NEW SMS RECEIVED</b> 》\n"
-                                    f"━━━━━━━━━━━━━━\n\n"
-                                    f"📞 <b>Number:</b> <code>{number}</code>\n"
-                                    f"🔑 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n\n"
-                                    f"✅ <b>Auto-detected via MySmsPortal!</b>\n"
-                                    f"━━━━━━━━━━━━━━",
-                                    parse_mode="HTML")
-                            except Exception as e:
-                                log(f"[OTP SCANNER] Notify failed: {e}")
-                            # GLOBAL dedup: only forward to group if no monitor already did
-                            gkey = global_otp_hash(number, otp_code, "")
-                            if is_otp_seen(gkey):
-                                sess["status"] = "awaiting_otp"
-                                continue
+                        if not (num_clean and (num_clean in sms_phone or sms_phone in num_clean)):
+                            continue
+                        otp_code = sms.get("otp", "")
+                        if not otp_code:
+                            continue
+                        # Credit and mark session
+                        sess["status"] = "completed"
+                        sess["otp_code"] = otp_code
+                        data.setdefault("number_session", {})[sid] = sess
+                        uid = str(sess.get("user_id"))
+                        data.setdefault("balances", {})[uid] = data.get("balances", {}).get(uid, 0.0) + price
+                        data.setdefault("otp_counts", {})[uid] = data.get("otp_counts", {}).get(uid, 0) + 1
+                        save_data(data)
+                        user_id = sess.get("user_id")
+                        try:
+                            bot.send_message(user_id,
+                                f"━━━━━━━━━━━━━━\n"
+                                f"《 📱 <b>NEW SMS RECEIVED</b> 》\n"
+                                f"━━━━━━━━━━━━━━\n\n"
+                                f"📞 <b>Number:</b> <code>{number}</code>\n"
+                                f"🔑 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n\n"
+                                f"✅ <b>Auto-detected via MySmsPortal!</b>\n"
+                                f"━━━━━━━━━━━━━━",
+                                parse_mode="HTML")
+                        except Exception as e:
+                            log(f"[OTP SCANNER] Notify failed: {e}")
+                        # Global dedup: only forward to group if no monitor already did
+                        gkey = global_otp_hash(number, otp_code, sms.get("service", ""))
+                        if not is_otp_seen(gkey):
                             mark_otp_seen(gkey)
-                            # Build Vertex-format message for group
                             country_name = sess.get("country", "Unknown")
                             cflag = get_country_flag(country_name)
                             masked_num = number[:7] + "****" + number[-4:] if len(number) > 11 else number
                             formatted_otp = f"{otp_code[:3]}-{otp_code[3:]}" if len(otp_code) == 6 and otp_code.isdigit() else otp_code
-                            svc_emoji = emo(app_name)
+                            svc_emoji = emo(sess.get("app", "?"))
                             ts = datetime.now().strftime("%H:%M:%S")
                             wm = load_data().get("watermark", "VERTEX OTP")
                             sep = "\u2501" * 13
                             group_msg = (
-                                f"{wm}\n"
-                                f"{sep}\n"
-                                f"{cflag} {svc_emoji} {app_name.upper()} \U0001f7e2\n"
+                                f"{wm}\n{sep}\n"
+                                f"{cflag} {svc_emoji} {sess.get('app', '?').upper()} \U0001f7e2\n"
                                 f"\U0001f4f1 {masked_num}\n"
                                 f"\U0001f511 OTP: {formatted_otp}\n"
                                 f"Don't share this code with others\n"
                                 f"\u23f0 {ts}"
                             )
                             forward_to_forward_groups(group_msg)
-                            log(f"[OTP SCANNER] Matched: {otp_code} -> {number}")
-                            # Reset status so subsequent OTPs for this number can also be processed
-                            sess["status"] = "awaiting_otp"
+                        log(f"[OTP SCANNER] Matched: {otp_code} -> {number}")
+                        # Reset so the session can receive subsequent OTPs
+                        sess["status"] = "awaiting_otp"
             except Exception as e:
                 log(f"[OTP SCANNER ERROR] {e}")
             time.sleep(15)
