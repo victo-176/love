@@ -8784,9 +8784,9 @@ if __name__ == "__main__":
                         continue
                     # No per-number cooldown: multiple OTPs to the same number
                     # must ALL be delivered; OTP-level dedup handles duplicates.
-                    # Check all active sessions for matching number
-                    matched_session = None
-                    matched_sid = None
+                    # Check ALL active sessions for matching number (no break:
+                    # every session/user on this number must get every OTP)
+                    matched_sessions = []
                     for sid, sess in list(sessions.items()):
                         if sess.get('status') not in ('awaiting_otp', 'polling'):
                             continue
@@ -8794,10 +8794,8 @@ if __name__ == "__main__":
                         if not session_number:
                             continue
                         if session_number in entry_number or entry_number in session_number:
-                            matched_session = sess
-                            matched_sid = sid
-                            break
-                    if not matched_session:
+                            matched_sessions.append((sid, sess))
+                    if not matched_sessions:
                         # Still process: forward to group even without active session
                         pass
                     # Fetch ALL message texts from mysmsportal (list)
@@ -8823,9 +8821,9 @@ if __name__ == "__main__":
                         if otp_hash in mysmsportal_seen_otp:
                             log(f"[MYSMSPORTAL] OTP already sent: {otp_code} for {entry['number']}, skipping")
                             continue
-                        # Update session and credit user if matched
-                        if matched_session:
-                            sess = matched_session
+                        # Update sessions and credit users if matched
+                        # Loop over ALL matching sessions so every user gets every OTP
+                        for matched_sid, sess in matched_sessions:
                             sess['status'] = 'completed'
                             sess['otp_code'] = otp_code
                             data.setdefault('number_session', {})[matched_sid] = sess
@@ -8886,7 +8884,7 @@ if __name__ == "__main__":
                         )
                         forward_to_forward_groups(group_msg)
                         mysmsportal_seen_otp.add(otp_hash)
-                        log(f"[MYSMSPORTAL] OTP forwarded: {otp_code} -> {number} (matched={bool(matched_session)})")
+                        log(f"[MYSMSPORTAL] OTP forwarded: {otp_code} -> {number} (matched={len(matched_sessions)} sessions)")
                     mysmsportal_seen.add(entry_id)
                 save_mysmsportal_seen()
                 save_mysmsportal_seen_otp()
