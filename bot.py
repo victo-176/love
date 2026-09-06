@@ -4972,14 +4972,15 @@ def callback_handler(call):
         bot.answer_callback_query(call.id)
         data_obj = load_data()
         bal = data_obj.get("balances", {}).get(str(chat_id), 0.0)
-        if bal < 1.0:
+        min_wd = data_obj.get("min_withdraw", 1.0)
+        if bal < min_wd:
             markup = InlineKeyboardMarkup().add(ibtn("🔙 BACK", callback_data="close_menu", style="primary"))
             safe_edit(chat_id,
                 f"━━━━━━━━━━━━━━━\n"
                 f"《 💳 <b>WITHDRAWAL</b> 》\n"
                 f"━━━━━━━━━━━━━━━\n\n"
                 f"💰 <b>BALANCE:</b> ${bal:.2f}\n"  # FIXED: 2 decimal places
-                f"⚠️ <b>MINIMUM WITHDRAWAL: $1.00</b>\n\n"
+                f"⚠️ <b>MINIMUM WITHDRAWAL: ${min_wd:.2f}</b>\n\n"
                 f"<b>EARN MORE VIA REFERRALS!</b>\n"
                 f"━━━━━━━━━━━━━━━",
                 markup, message_id)
@@ -5747,7 +5748,7 @@ def callback_handler(call):
         d = load_data()
         d["force_join_enabled"] = not d.get("force_join_enabled", False)
         save_data(d)
-        show_force_join_menu(chat_id, message_id)
+        show_force_join_message(chat_id, message_id)
 
     elif data == "add_fjc":
         bot.answer_callback_query(call.id)
@@ -5768,7 +5769,7 @@ def callback_handler(call):
             d["force_join_channels"] = channels
             save_data(d)
             bot.answer_callback_query(call.id, "✅ Channel removed!")
-        show_force_join_menu(chat_id, message_id)
+        show_force_join_message(chat_id, message_id)
 
     # ============ OTP GROUP MANAGEMENT ============
     elif data == "set_main_otp_link":
