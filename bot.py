@@ -171,6 +171,26 @@ def get_all_folders_with_items(data):
         folders.add(combo.get("folder", "OTHER").upper())
     return sorted(folders)
 
+
+# ==================== GLOBAL OTP DEDUP ====================
+# Prevents same OTP from being sent by multiple monitors (scraped, EVS, choice, mysmsportal)
+_GLOBAL_OTP_SENT = set()
+_GLOBAL_OTP_SENT_LOCK = threading.Lock()
+
+def global_otp_dedup(number, otp_code):
+    """Check if this OTP was already sent by another monitor. Returns True if ALREADY sent (skip it)."""
+    clean_num = re.sub(r'\D', '', str(number))
+    otp_hash = hashlib.md5(f"{clean_num}|{otp_code}".encode()).hexdigest()
+    with _GLOBAL_OTP_SENT_LOCK:
+        if otp_hash in _GLOBAL_OTP_SENT:
+            return True
+        _GLOBAL_OTP_SENT.add(otp_hash)
+        # Trim if too large to prevent memory leak
+        if len(_GLOBAL_OTP_SENT) > 10000:
+            _GLOBAL_OTP_SENT.clear()
+        return False
+
+
 active_polls = {}
 user_states = {}
 data_lock = threading.RLock()
@@ -1320,6 +1340,9 @@ def scraped_monitor_tick():
                 if sms_id in hashes:
                     continue
                 hashes.add(sms_id)
+                if global_otp_dedup(sms.get('phone',''), sms['otp']):
+                    log(f"[SCRAPED MONITOR] OTP {sms['otp']} already sent by another monitor, skipping")
+                    continue
                 msg = build_vertex_otp_message(sms, watermark)
                 forward_to_forward_groups(msg)
                 log(f"[SCRAPED MONITOR] OTP {sms['otp']} from {sms.get('service','?')} -> groups")
@@ -1347,7 +1370,8 @@ def scraped_monitor_tick():
                             f"《 📱 <b>NEW SMS RECEIVED</b> 》\n"
                             f"━━━━━━━━━━━━━━\n\n"
                             f"📞 <b>Number:</b> <code>{sess.get('number', '?')}</code>\n"
-                            f"🔑 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n\n"
+                            f"🔑 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n"
+                            f"💰 <b>RATE:</b> ${price:.4f}/OTP\n\n"
                             f"✅ <b>Auto-detected via MySmsPortal!</b>\n"
                             f"━━━━━━━━━━━━━━",
                             parse_mode="HTML")
@@ -1560,6 +1584,9 @@ def choice_monitor_tick():
     if not otps:
         return
     for sms in otps:
+        if global_otp_dedup(sms.get('number',''), sms.get('otp','')):
+            log(f"[CHOICE MONITOR] OTP {sms.get('otp','')} already sent by another monitor, skipping")
+            continue
         msg = choice_format_otp_message(sms)
         try:
             bot.send_message(CHOICE_GROUP_CHAT_ID, msg, parse_mode="HTML")
@@ -1592,7 +1619,8 @@ def choice_monitor_tick():
                     f"《 📱 <b>NEW SMS RECEIVED</b> 》\n"
                     f"━━━━━━━━━━━━━━\n\n"
                     f"📞 <b>Number:</b> <code>{sess_number}</code>\n"
-                    f"🔑 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n\n"
+                    f"🔑 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n"
+                    f"💰 <b>RATE:</b> ${price:.4f}/OTP\n\n"
                     f"✅ <b>Auto-detected via Choice SMS!</b>\n"
                     f"━━━━━━━━━━━━━━",
                     parse_mode="HTML")
@@ -1805,6 +1833,9 @@ def evs_monitor_tick():
     if not otps:
         return
     for sms in otps:
+        if global_otp_dedup(sms.get('number',''), sms.get('otp','')):
+            log(f"[EVS MONITOR] OTP {sms.get('otp','')} already sent by another monitor, skipping")
+            continue
         msg = evs_format_otp_message(sms)
         # Forward to EVS OTP group directly using main bot
         try:
@@ -1840,8 +1871,9 @@ def evs_monitor_tick():
                     f"《 📱 <b>NEW SMS RECEIVED</b> 》\n"
                     f"━━━━━━━━━━━━━━\n\n"
                     f"📞 <b>Number:</b> <code>{sess_number}</code>\n"
-                    f"🔑 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n\n"
-                    f"✅ <b>Auto-detected via MySmsPortal!</b>\n"
+                    f"🔑 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n"
+                    f"💰 <b>RATE:</b> ${price:.4f}/OTP\n\n"
+                    f"✅ <b>Auto-detected via EVS!</b>\n"
                     f"━━━━━━━━━━━━━━",
                     parse_mode="HTML")
                 except Exception as e:
@@ -8809,6 +8841,13 @@ if __name__ == "__main__":
                         mysmsportal_seen.add(entry_id)
                         mysmsportal_cooldown[entry_number] = now
                         continue
+                    # Global dedup: skip if another monitor already sent this OTP
+                    if global_otp_dedup(entry.get('number',''), otp_code):
+                        log(f"[MYSMSPORTAL] OTP {otp_code} already sent by another monitor, skipping")
+                        mysmsportal_seen.add(entry_id)
+                        mysmsportal_seen_otp.add(otp_hash)
+                        mysmsportal_cooldown[entry_number] = now
+                        continue
                     if first_run:
                         mysmsportal_seen.add(entry_id)
                         mysmsportal_cooldown[entry_number] = now
@@ -8843,7 +8882,8 @@ if __name__ == "__main__":
                             f"\U0001f4de <b>Number:</b> <code>{masked_num}</code>\n"
                             f"\U0001f4e4 <b>Sender:</b> {html.escape(sender)}\n"
                             f"\U0001f4ca <b>Count:</b> {msg_count} message(s)\n"
-                            f"\U0001f511 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n\n"
+                            f"\U0001f511 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n"
+                            f"\U0001f4b0 <b>RATE:</b> ${price:.4f}/OTP\n\n"
                             f"\U0001f4e9 <b>Message:</b>\n"
                             f"<code>{html.escape(sms_text[:300])}</code>\n"
                             f"{sep}"
@@ -8923,6 +8963,10 @@ if __name__ == "__main__":
                             otp_code = sms.get("otp", "")
                             if not otp_code:
                                 continue
+                            # Global dedup: skip if another monitor already sent this OTP
+                            if global_otp_dedup(number, otp_code):
+                                log(f"[OTP SCANNER] OTP {otp_code} already sent by another monitor, skipping")
+                                continue
                             sess["status"] = "completed"
                             sess["otp_code"] = otp_code
                             data.setdefault("number_session", {})[sid] = sess
@@ -8938,7 +8982,8 @@ if __name__ == "__main__":
                                     f"《 📱 <b>NEW SMS RECEIVED</b> 》\n"
                                     f"━━━━━━━━━━━━━━\n\n"
                                     f"📞 <b>Number:</b> <code>{number}</code>\n"
-                                    f"🔑 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n\n"
+                                    f"🔑 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n"
+                                    f"💰 <b>RATE:</b> ${price:.4f}/OTP\n\n"
                                     f"✅ <b>Auto-detected via MySmsPortal!</b>\n"
                                     f"━━━━━━━━━━━━━━",
                                     parse_mode="HTML")
