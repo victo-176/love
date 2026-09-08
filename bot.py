@@ -4209,26 +4209,33 @@ def get_number_from_panel(panel_id, rng_id, user_id=None, app_name=None):
         used = rng.get("used_numbers", [])
         available = [n for n in nums if n not in used]
         if not available:
-            # Auto-recycle: if all numbers used, reset used list
-            if nums:
-                rng["used_numbers"] = []
-                used = []
-                available = nums[:]  # all become available again
-                log(f"[MANUAL] Auto-recycled numbers for {panel.get('name')}/{rng.get('name')}")
-                save_data(data)
-            else:
-                return None
+            return None
         chosen = available[0]
-        # Mark as used
-        if chosen not in used:
-            used.append(chosen)
+        # Permanently delete number from stock so no other user can get it
+        rng["numbers"] = [n for n in nums if n != chosen]
+        if chosen in used:
+            used.remove(chosen)
         rng["used_numbers"] = used
+        # Also delete from countries in this range
+        for cty in rng.get("countries", {}).keys():
+            if isinstance(rng["countries"].get(cty), list):
+                rng["countries"][cty] = [n for n in rng["countries"][cty] if n != chosen]
         save_data(data)
         # Return just the number, no activation_id for manual
         if not chosen.startswith("+"):
             chosen = "+" + chosen
         return {"number": chosen, "activation_id": None}
 
+
+def get_all_active_session_numbers():
+    data = load_data()
+    active_numbers = set()
+    for sid, sess in data.get("number_session", {}).items():
+        if sess.get("status") in ("awaiting_otp", "polling"):
+            num = re.sub(r'\D', '', sess.get("number", ""))
+            if num:
+                active_numbers.add(num)
+    return active_numbers
 
 # -------------------- FIND NUMBER FOR USER (All Panels Search) --------------------
 def find_number_for_user(app_name, country_name=None, user_id=None):
@@ -4247,6 +4254,7 @@ def find_number_for_user(app_name, country_name=None, user_id=None):
             continue
         combo_countries = combo.get("countries", {})
         combo_used = combo.get("used_numbers", [])
+        active_nums = get_all_active_session_numbers()
         log(f"[FIND] Found combo: {combo.get('name')}, countries={list(combo_countries.keys())}, used={len(combo_used)}")
 
         # Find matching country numbers
@@ -4257,14 +4265,14 @@ def find_number_for_user(app_name, country_name=None, user_id=None):
             for cty, nums in combo_countries.items():
                 if cty.lower() == target:
                     matched_country = cty
-                    available = [n for n in nums if n not in combo_used]
+                    available = [n for n in nums if n not in combo_used and re.sub(r'\D', '', n) not in active_nums]
                     log(f"[FIND] Matched country: {cty}, available={len(available)}")
                     break
             if not available:
                 log(f"[FIND] No match for country '{country_name}' in {list(combo_countries.keys())}")
         else:
             for cty, nums in combo_countries.items():
-                avail = [n for n in nums if n not in combo_used]
+                avail = [n for n in nums if n not in combo_used and re.sub(r'\D', '', n) not in active_nums]
                 if avail:
                     matched_country = cty
                     available = avail
@@ -4290,15 +4298,21 @@ def find_number_for_user(app_name, country_name=None, user_id=None):
             }
 
     # Fallback: if no country matched, pick ANY available number from the combo
+    active_nums = get_all_active_session_numbers()
     for combo in data.get("combos", []):
         if combo.get("name", "").upper() != app_name.upper():
             continue
         combo_used = combo.get("used_numbers", [])
-        all_available = [n for n in combo.get("numbers", []) if n not in combo_used]
+        all_available = [n for n in combo.get("numbers", []) if n not in combo_used and re.sub(r"\D", "", n) not in active_nums]
         if all_available:
             number = random.choice(all_available)
             combo_used.append(number)
             combo["used_numbers"] = combo_used
+            # Permanently delete from stock
+            combo["numbers"] = [n for n in combo.get("numbers", []) if n != number]
+            for cty in combo.get("countries", {}).keys():
+                if isinstance(combo["countries"].get(cty), list):
+                    combo["countries"][cty] = [n for n in combo["countries"][cty] if n != number]
             save_data(data)
             cty = detect_country_from_phone(number)
             log(f"[FIND] Fallback: {number} from {cty}")
@@ -4311,7 +4325,8 @@ def find_number_for_user(app_name, country_name=None, user_id=None):
                 "country": cty
             }
 
-    # Fallback: search panel ranges
+    # Fallback: search panel ranges (skip ranges with 0 available numbers)
+    active_nums = get_all_active_session_numbers()
     candidates = []
     for panel_id, panel in data.get("panels", {}).items():
         if panel.get("status") != "active":
@@ -4322,6 +4337,12 @@ def find_number_for_user(app_name, country_name=None, user_id=None):
                 continue
             rng_name = rng.get("name", "").lower()
             if country_name and rng_name != country_name.lower():
+                continue
+            # Skip ranges with no numbers available (or all numbers in active sessions)
+            nums = rng.get("numbers", [])
+            used = rng.get("used_numbers", [])
+            rng_avail = [n for n in nums if n not in used and re.sub(r'\D', '', n) not in active_nums]
+            if not rng_avail:
                 continue
             candidates.append((panel_id, panel, rng_id, rng))
     candidates.sort(key=lambda x: (0 if x[1].get("fetch_type") == "auto" else 1))
@@ -4652,17 +4673,25 @@ def cancel_number_session(chat_id, session_id, message_id=None):
     rng_id = session.get("rng_id", "")
     activation_id = session.get("activation_id", "")
 
-    # For manual panels: recycle number back to available pool
-    if panel_id and rng_id and str(activation_id).startswith("MANUAL_"):
-        panel = data.get("panels", {}).get(panel_id)
-        if panel:
-            rng = panel.get("ranges", {}).get(rng_id)
-            if rng:
-                used = rng.get("used_numbers", [])
-                if number in used:
-                    used.remove(number)
-                    rng["used_numbers"] = used
-                    log(f"[RECYCLE] Number {number} returned to pool")
+    # Permanently delete number from ALL combos (never give to another user)
+    for combo in data.get("combos", []):
+        if number in combo.get("used_numbers", []):
+            combo["used_numbers"].remove(number)
+        combo["numbers"] = [n for n in combo.get("numbers", []) if n != number]
+        for cty in combo.get("countries", {}).keys():
+            if isinstance(combo["countries"].get(cty), list):
+                combo["countries"][cty] = [n for n in combo["countries"][cty] if n != number]
+
+    # Permanently delete from ALL panel ranges too
+    for pid_key, pnl in data.get("panels", {}).items():
+        for rid, rng in pnl.get("ranges", {}).items():
+            if number in rng.get("used_numbers", []):
+                rng["used_numbers"].remove(number)
+            rng["numbers"] = [n for n in rng.get("numbers", []) if n != number]
+            for cty in rng.get("countries", {}).keys():
+                if isinstance(rng["countries"].get(cty), list):
+                    rng["countries"][cty] = [n for n in rng["countries"][cty] if n != number]
+    log(f"[CANCEL] Deleted number {number} from all stock permanently")
 
     # Remove session
     data.setdefault("number_session", {}).pop(session_id, None)
@@ -4777,16 +4806,25 @@ def callback_handler(call):
             if sess.get("user_id") == chat_id and sess.get("app", "").upper() == app_name.upper() and sess.get("status") in ("awaiting_otp", "polling"):
                 sess["status"] = "changed"
                 sessions[sid] = sess
-                # Permanently delete old number from stock
+                num = sess.get("number", "")
+                # Permanently delete old number from ALL combos
                 for combo in d.get("combos", []):
-                    if combo.get("name", "").upper() == app_name.upper():
-                        num = sess.get("number", "")
-                        if num in combo.get("used_numbers", []):
-                            combo["used_numbers"].remove(num)
-                        # Delete from numbers list permanently
-                        combo["numbers"] = [n for n in combo.get("numbers", []) if n != num]
-                        for cty in combo.get("countries", {}).keys():
+                    if num in combo.get("used_numbers", []):
+                        combo["used_numbers"].remove(num)
+                    combo["numbers"] = [n for n in combo.get("numbers", []) if n != num]
+                    for cty in combo.get("countries", {}).keys():
+                        if isinstance(combo["countries"].get(cty), list):
                             combo["countries"][cty] = [n for n in combo["countries"][cty] if n != num]
+                # Also delete from ALL panel ranges
+                for pid, panel in d.get("panels", {}).items():
+                    for rid, rng in panel.get("ranges", {}).items():
+                        if num in rng.get("used_numbers", []):
+                            rng["used_numbers"].remove(num)
+                        rng["numbers"] = [n for n in rng.get("numbers", []) if n != num]
+                        for cty in rng.get("countries", {}).keys():
+                            if isinstance(rng["countries"].get(cty), list):
+                                rng["countries"][cty] = [n for n in rng["countries"][cty] if n != num]
+                log(f"[CHANGE_NUM] Deleted number {num} from all stock (combos + panels)")
                 break
         d["number_session"] = sessions
         save_data(d)
