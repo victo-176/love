@@ -1514,6 +1514,12 @@ def choice_fetch_otps(panel_cfg=None):
                     full_text = record_text[:500]
                 if not full_text:
                     continue
+                # Extract full phone number from full_text for accurate dedup
+                full_number_match = re.search(r'(\d{10,15})', full_text)
+                if full_number_match:
+                    full_num = full_number_match.group(1)
+                    if len(full_num) > len(re.sub(r"\D", "", number)):
+                        number = full_num
                 otp_match = re.search(r'code\s*[:]?\s*(\d{4,6})', full_text, re.IGNORECASE)
                 if not otp_match:
                     otp_match = re.search(r'\b(\d{4,6})\b', full_text)
@@ -1718,6 +1724,12 @@ def evs_fetch_otps(panel_cfg=None):
                 number = str(record[2]) if record[2] else ""
                 service = str(record[3]) if record[3] else "Unknown"
                 full_text = str(record[5]) if len(record) > 5 and record[5] else ""
+                # Extract full phone number from full_text for accurate dedup
+                full_number_match_ev = re.search(r'(\d{10,15})', full_text)
+                if full_number_match_ev:
+                    full_num_ev = full_number_match_ev.group(1)
+                    if len(full_num_ev) > len(re.sub(r"\D", "", number)):
+                        number = full_num_ev
                 otp_match = re.search(r'code\s+(\d{4,6})', full_text, re.IGNORECASE)
                 if not otp_match:
                     otp_match = re.search(r'use code\s+(\d{4,6})', full_text, re.IGNORECASE)
@@ -6620,6 +6632,11 @@ def process_otp(sms, panel_name):
     3. DM every active session matching the number (no break; session stays active).
     Returns True if the OTP was new (forwarded), False if it was a duplicate."""
     number = str(sms.get('number', '') or sms.get('phone', ''))
+    # Extract full number from full_text if available (fixes truncated number dedup)
+    _ft = str(sms.get("full_text", ""))
+    _fn_match = re.search(r"(\d{10,15})", _ft)
+    if _fn_match and len(_fn_match.group(1)) > len(re.sub(r"\D", "", number)):
+        number = _fn_match.group(1)
     otp_code = str(sms.get('otp', ''))
     service = str(sms.get('service', ''))
     if not number or not otp_code:
