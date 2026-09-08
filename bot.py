@@ -5722,8 +5722,9 @@ def callback_handler(call):
         bot.answer_callback_query(call.id)
         data_obj = load_data()
         bal = data_obj.get("balances", {}).get(str(chat_id), 0.0)
-        if bal < 1.0:
-            bot.answer_callback_query(call.id, "❌ Minimum withdrawal is $1.00", show_alert=True)
+        min_wd = data_obj.get("min_withdraw", 1.0)
+        if bal < min_wd:
+            bot.answer_callback_query(call.id, f"❌ Minimum withdrawal is ${min_wd:.2f}", show_alert=True)
             return
         user_states[chat_id] = {"state": "withdraw_amount"}
         safe_edit(chat_id,
@@ -8624,7 +8625,7 @@ def text_handler(message):
                 f"《 💳 <b>WITHDRAWAL</b> 》\n"
                 f"━━━━━━━━━━━━━━━\n\n"
                 f"💰 <b>YOUR BALANCE:</b> ${bal:.2f}\n"  # FIXED: 2 decimal places
-                f"✅ <b>MINIMUM: $1.00</b>\n\n"
+                f"✅ <b>MINIMUM: ${min_wd:.2f}</b>\n\n"
                 f"<b>TAP BELOW TO REQUEST</b>\n"
                 f"━━━━━━━━━━━━━━━",
                 markup)
