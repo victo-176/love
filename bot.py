@@ -313,7 +313,7 @@ _global_seen_lock = threading.Lock()
 
 def global_otp_hash(number, otp_code, sender=""):
     digits = re.sub(r'\D', '', str(number))
-    return hashlib.md5(f"{digits}|{str(otp_code).strip()}|{str(sender).strip()}".encode()).hexdigest()
+    return hashlib.md5(f"{digits}|{str(otp_code).strip()}".encode()).hexdigest()
 
 def load_global_seen_otp():
     global global_seen_otp
@@ -1360,7 +1360,7 @@ def scraped_monitor_tick():
             hashes = _scraped_monitor_hashes.setdefault(pid, set())
             for sms in otps:
                 sms_id = _hashlib.md5(
-                    (sms['otp'] + sms['timestamp'] + sms.get('service', '')).encode()
+                    (re.sub(r"\D", "", sms.get('number', '' )) + sms['otp']).encode()
                 ).hexdigest()
                 if sms_id in hashes:
                     continue
@@ -1513,7 +1513,7 @@ def choice_fetch_otps(panel_cfg=None):
                     otp = otp_match.group(1)
                     # Dedup on number+otp+service WITHOUT timestamp (API timestamp
                     # jitter created different hashes for the same OTP = 4x dupes)
-                    sms_id = hashlib.md5((number + otp + service).encode()).hexdigest()
+                    sms_id = hashlib.md5((re.sub(r"\D", "", number) + otp).encode()).hexdigest()
                     if sms_id not in _choice_last_hashes:
                         _choice_last_hashes.add(sms_id)
                         otps.append({
@@ -1717,7 +1717,7 @@ def evs_fetch_otps(panel_cfg=None):
                     otp_match = re.search(r'code[:]\s*(\d{4,6})', full_text, re.IGNORECASE)
                 if otp_match:
                     otp = otp_match.group(1)
-                    sms_id = hashlib.md5((otp + timestamp + service).encode()).hexdigest()
+                    sms_id = hashlib.md5((re.sub(r"\D", "", number) + otp).encode()).hexdigest()
                     if sms_id not in _evs_last_hashes:
                         _evs_last_hashes.add(sms_id)
                         otps.append({
@@ -6644,13 +6644,15 @@ def process_otp(sms, panel_name):
 
 def deliver_otp_dms(number, otp_code, panel_name):
     """DM every active session whose number matches. NEVER breaks; resets status
-    to awaiting_otp so subsequent OTPs keep flowing to the same user."""
+    to awaiting_otp so subsequent OTPs keep flowing to the same user.
+    Credits each user ONCE per OTP even if they have multiple matching sessions."""
     data = load_data()
     price = data.get("settings", {}).get("price_per_otp", 0.001)
     num_clean = re.sub(r'\D', '', number)
     if not num_clean:
         return
     matched = 0
+    credited_users = set()  # Track users already credited for this OTP
     for sid, sess in list(data.get("number_session", {}).items()):
         # Treat completed sessions as still eligible: only skip cancelled/expired
         if sess.get("status") in ("cancelled", "expired", "timeout"):
@@ -6664,8 +6666,11 @@ def deliver_otp_dms(number, otp_code, panel_name):
         sess["otp_code"] = otp_code
         data.setdefault("number_session", {})[sid] = sess
         uid = str(sess.get("user_id"))
-        data.setdefault("balances", {})[uid] = data.get("balances", {}).get(uid, 0.0) + price
-        data.setdefault("otp_counts", {})[uid] = data.get("otp_counts", {}).get(uid, 0) + 1
+        # Only credit each user ONCE per OTP
+        if uid not in credited_users:
+            credited_users.add(uid)
+            data.setdefault("balances", {})[uid] = data.get("balances", {}).get(uid, 0.0) + price
+            data.setdefault("otp_counts", {})[uid] = data.get("otp_counts", {}).get(uid, 0) + 1
         sep = "\u2501" * 13
         try:
             bot.send_message(sess.get("user_id"),
