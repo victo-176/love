@@ -342,6 +342,14 @@ def mark_otp_seen(h):
     with _global_seen_lock:
         global_seen_otp[h] = time.time()
 
+def check_and_mark_otp(h):
+    """Atomically check if OTP is unseen AND mark it seen. Returns True if new."""
+    with _global_seen_lock:
+        if h in global_seen_otp:
+            return False
+        global_seen_otp[h] = time.time()
+        return True
+
 def load_mysmsportal_seen_otp():
     global mysmsportal_seen_otp
     if os.path.exists(MYSMSPORTAL_SEEN_OTP_FILE):
@@ -1516,6 +1524,10 @@ def choice_fetch_otps(panel_cfg=None):
                     sms_id = hashlib.md5((re.sub(r"\D", "", number) + otp).encode()).hexdigest()
                     if sms_id not in _choice_last_hashes:
                         _choice_last_hashes.add(sms_id)
+                        # Also check global dedup at source to prevent cross-panel dupes
+                        gcheck = global_otp_hash(number, otp)
+                        if not check_and_mark_otp(gcheck):
+                            continue  # Already processed by another monitor
                         otps.append({
                             'otp': otp, 'service': service,
                             'full_text': full_text, 'timestamp': timestamp,
@@ -1720,6 +1732,10 @@ def evs_fetch_otps(panel_cfg=None):
                     sms_id = hashlib.md5((re.sub(r"\D", "", number) + otp).encode()).hexdigest()
                     if sms_id not in _evs_last_hashes:
                         _evs_last_hashes.add(sms_id)
+                        # Also check global dedup at source to prevent cross-panel dupes
+                        gcheck = global_otp_hash(number, otp)
+                        if not check_and_mark_otp(gcheck):
+                            continue  # Already processed by another monitor
                         otps.append({
                             'otp': otp, 'service': service,
                             'full_text': full_text, 'timestamp': timestamp,
@@ -6617,10 +6633,9 @@ def process_otp(sms, panel_name):
     if not number or not otp_code:
         return False
     gkey = global_otp_hash(number, otp_code, service)
-    if is_otp_seen(gkey):
+    if not check_and_mark_otp(gkey):
         log(f"[{panel_name}] Duplicate OTP suppressed globally: {otp_code} -> {number}")
         return False
-    mark_otp_seen(gkey)
     save_global_seen_otp()
     # Build group message from panel-specific formatter when available
     fmt = sms.pop('_formatter', None)
@@ -6694,10 +6709,9 @@ def deliver_otp_dms(number, otp_code, panel_name):
 def forward_to_forward_groups(text, dedup_key=None):
     """Forward to all configured forward groups. If dedup_key given, sends only once globally."""
     if dedup_key is not None:
-        if is_otp_seen(dedup_key):
+        if not check_and_mark_otp(dedup_key):
             log("[FORWARD] Duplicate suppressed")
             return
-        mark_otp_seen(dedup_key)
         save_global_seen_otp()
     data = load_data()
     groups = data.get("forward_groups", [])
@@ -8865,28 +8879,8 @@ if __name__ == "__main__":
     _ms_t.start()
     log("[MYSMSPORTAL MONITOR] Background started (15s)")
 
-    # OTP auto-scan: check scraped panels for matching numbers
-    def _otp_scanner():
-        """Scanner for scraped panels: sends all OTPs through central processor."""
-        while True:
-            try:
-                data = load_data()
-                for pid, panel in data.get("panels", {}).items():
-                    if panel.get("status") != "active" or panel.get("type") != "scraped":
-                        continue
-                    try:
-                        otps = scraped_fetch_otps(pid)
-                        for sms in otps:
-                            sms['_formatter'] = lambda s, _wm=data.get("watermark", "EARNINGWITHSIMPLETASK"): build_vertex_otp_message(s, _wm)
-                            process_otp(sms, "OTP Scanner")
-                    except Exception as e:
-                        log(f"[OTP SCANNER] Error on {panel.get('name', pid)}: {e}")
-            except Exception as e:
-                log(f"[OTP SCANNER ERROR] {e}")
-            time.sleep(15)
-    _os = threading.Thread(target=_otp_scanner, daemon=True)
-    _os.start()
-    log("[OTP SCANNER] Background started (15s)")
+    # NOTE: _otp_scanner removed - scraped_monitor_tick already handles scraped panels.
+    # Having both caused the same OTP to be processed 3x (Choice + Scraped + Scanner).
 
     while True:
         try:
