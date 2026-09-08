@@ -1741,10 +1741,10 @@ def evs_fetch_otps(panel_cfg=None):
                     if sms_id not in _evs_last_hashes:
                         _evs_last_hashes.add(sms_id)
                         otps.append({
-                            'otp': otp, 'service': service,
-                            'full_text': full_text, 'timestamp': timestamp,
-                            'range': range_name, 'number': number
-                        })
+                                'otp': otp, 'service': service,
+                                'full_text': full_text, 'timestamp': timestamp,
+                                'range': range_name, 'number': number
+                            })
         if otps:
             log(f"[EVS] Found {len(otps)} new OTPs")
     except Exception as e:
@@ -6677,6 +6677,7 @@ def deliver_otp_dms(number, otp_code, panel_name):
         return
     matched = 0
     credited_users = set()  # Track users already credited for this OTP
+    dm_sent = set()  # Track users already DM'd for this OTP
     for sid, sess in list(data.get("number_session", {}).items()):
         # Treat completed sessions as still eligible: only skip cancelled/expired
         if sess.get("status") in ("cancelled", "expired", "timeout"):
@@ -6697,19 +6698,22 @@ def deliver_otp_dms(number, otp_code, panel_name):
             data.setdefault("otp_counts", {})[uid] = data.get("otp_counts", {}).get(uid, 0) + 1
         sep = "\u2501" * 13
         user_bal = data.get("balances", {}).get(uid, 0.0)
-        try:
-            bot.send_message(sess.get("user_id"),
-                f"{sep}\n"
-                f"\u300a \U0001f4f1 <b>NEW SMS RECEIVED</b> \u300b\n{sep}\n\n"
-                f"\U0001f4de <b>Number:</b> <code>{sess_number}</code>\n"
-                f"\U0001f511 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n\n"
-                f"💰 <b>EARNED:</b> ${price:.4f}\n"
-                f"💵 <b>BALANCE:</b> ${user_bal:.4f}\n"
-                f"\u2705 <b>Auto-detected!</b>\n"
-                f"{sep}",
-                parse_mode="HTML")
-        except Exception as e:
-            log(f"[{panel_name}] DM notify failed: {e}")
+        # Only send DM once per user per OTP (skip if user already got a DM)
+        if uid not in dm_sent:
+            dm_sent.add(uid)
+            try:
+                bot.send_message(sess.get("user_id"),
+                    f"{sep}\n"
+                    f"\u300a \U0001f4f1 <b>NEW SMS RECEIVED</b> \u300b\n{sep}\n\n"
+                    f"\U0001f4de <b>Number:</b> <code>{sess_number}</code>\n"
+                    f"\U0001f511 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n\n"
+                    f"💰 <b>EARNED:</b> ${price:.4f}\n"
+                    f"💵 <b>BALANCE:</b> ${user_bal:.4f}\n"
+                    f"\u2705 <b>Auto-detected!</b>\n"
+                    f"{sep}",
+                    parse_mode="HTML")
+            except Exception as e:
+                log(f"[{panel_name}] DM notify failed: {e}")
         # Reset so the session can receive subsequent OTPs
         sess["status"] = "awaiting_otp"
         log(f"[{panel_name}] DM delivered: {otp_code} -> {sess_number} (user {uid})")
