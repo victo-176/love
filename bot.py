@@ -1538,29 +1538,37 @@ def choice_fetch_otps(panel_cfg=None):
                     full_text = record_text[:500]
                 if not full_text:
                     continue
-                # Extract full phone number from full_text for accurate dedup
+                # Extract full phone number from full_text - but NEVER let
+                # "Username: 1234567890" / "Password: ..." text hijack the number.
                 full_number_match = re.search(r'(\d{10,15})', full_text)
                 if full_number_match:
-                    full_num = full_number_match.group(1)
-                    if len(full_num) > len(re.sub(r"\D", "", number)):
-                        number = full_num
+                    _ctx = full_text[max(0, full_number_match.start() - 30):full_number_match.start()].lower()
+                    if not ('username' in _ctx or 'password' in _ctx or 'user:' in _ctx or 'pass:' in _ctx):
+                        full_num = full_number_match.group(1)
+                        if len(full_num) > len(re.sub(r"\D", "", number)):
+                            number = full_num
                 otp_match = re.search(r'code\s*[:]?\s*(\d{4,6})', full_text, re.IGNORECASE)
                 if not otp_match:
                     otp_match = re.search(r'\b(\d{4,6})\b', full_text)
-                if otp_match:
-                    otp = otp_match.group(1)
-                    # Dedup on number+otp+service WITHOUT timestamp (API timestamp
-                    # jitter created different hashes for the same OTP = 4x dupes)
+                otp = otp_match.group(1) if otp_match else ""
+                # NO FILTER: keep every message - OTP codes AND plain texts
+                # (username/password payloads, payment notices, anything).
+                if otp:
+                    # Dedup on number+otp (API timestamp jitter = 4x dupes)
                     sms_id = hashlib.md5((re.sub(r"\D", "", number) + otp).encode()).hexdigest()
-                    if sms_id not in _choice_last_hashes:
-                        _choice_last_hashes.add(sms_id)
-                        otps.append({
-                            'otp': otp, 'service': service,
-                            'full_text': full_text, 'timestamp': timestamp,
-                            'range': range_name, 'number': number
-                        })
+                else:
+                    # Text-keyed dedup for OTP-less messages
+                    _num_digits = re.sub(r"\D", "", number)
+                    sms_id = hashlib.md5(("TXT|" + _num_digits + "|" + service + "|" + full_text).encode()).hexdigest()
+                if sms_id not in _choice_last_hashes:
+                    _choice_last_hashes.add(sms_id)
+                    otps.append({
+                        'otp': otp, 'service': service,
+                        'full_text': full_text, 'timestamp': timestamp,
+                        'range': range_name, 'number': number
+                    })
         if otps:
-            log(f"[CHOICE] Found {len(otps)} new OTPs")
+            log(f"[CHOICE] Found {len(otps)} new message(s)")
     except Exception as e:
         log(f"[CHOICE] Fetch error: {e}")
         _choice_logged_in = False
