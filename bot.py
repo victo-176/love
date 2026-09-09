@@ -367,8 +367,28 @@ def save_mysmsportal_seen_otp():
     with open(MYSMSPORTAL_SEEN_OTP_FILE, 'w') as f:
         json.dump(list(mysmsportal_seen_otp), f)
 
-def mysmsportal_login(session):
+def mysmsportal_session_valid(session):
+    """Check if the current session cookies still see the logged-in 'today status' page."""
     try:
+        resp = session.get(MYSMSPORTAL_TARGET_URL, timeout=20, allow_redirects=True)
+        if resp.status_code != 200:
+            return False
+        if "login" in resp.url.lower():
+            return False
+        # Expired sessions get bounced to the login form: detect it in the page body too.
+        body = resp.text[:6000].lower()
+        if ('name="user"' in body or 'name="password"' in body) and 'table_line' not in resp.text.lower():
+            return False
+        return True
+    except Exception:
+        return False
+
+def mysmsportal_login(session, force=False):
+    """Login to MySmsPortal. With force=True, always re-POST credentials (clears stale cookies)."""
+    try:
+        if not force and mysmsportal_session_valid(session):
+            return True
+        session.cookies.clear()
         resp = session.get(MYSMSPORTAL_LOGIN_URL, timeout=30)
         soup = BeautifulSoup(resp.text, 'html.parser')
         form = soup.find('form')
@@ -382,14 +402,12 @@ def mysmsportal_login(session):
         login_data['user'] = MYSMSPORTAL_USERNAME
         login_data['password'] = MYSMSPORTAL_PASSWORD
         response = session.post(MYSMSPORTAL_LOGIN_ACTION, data=login_data, timeout=30, allow_redirects=True)
-        if "login" not in response.url.lower():
+        if "login" not in response.url.lower() and mysmsportal_session_valid(session):
             log("[MYSMSPORTAL] Login successful!")
             return True
-        if session.cookies and len(session.cookies) > 0:
-            test_resp = session.get(MYSMSPORTAL_TARGET_URL, timeout=30)
-            if "login" not in test_resp.url.lower():
-                log("[MYSMSPORTAL] Login successful (cookies verified)!")
-                return True
+        if mysmsportal_session_valid(session):
+            log("[MYSMSPORTAL] Login successful (cookies verified)!")
+            return True
         log("[MYSMSPORTAL] Login failed.")
         return False
     except Exception as e:
@@ -398,9 +416,12 @@ def mysmsportal_login(session):
 
 def mysmsportal_fetch_today(session):
     try:
-        response = session.get(MYSMSPORTAL_TARGET_URL, timeout=30)
+        response = session.get(MYSMSPORTAL_TARGET_URL, timeout=30, allow_redirects=True)
         if response.status_code != 200:
             log(f"[MYSMSPORTAL] Failed to fetch page: {response.status_code}")
+            return []
+        if "login" in response.url.lower():
+            log("[MYSMSPORTAL] Fetch bounced to login page - session expired.")
             return []
         soup = BeautifulSoup(response.text, 'html.parser')
         rows = soup.find_all('tr', class_=re.compile(r'table_line_even|table_line_odd'))
@@ -439,6 +460,9 @@ def mysmsportal_fetch_otp(session, number, sender):
         data = {'ddi': number, 'oad': sender}
         response = session.post(detail_url, data=data, timeout=30, allow_redirects=True)
         if response.status_code != 200:
+            return []
+        if "login" in response.url.lower():
+            log("[MYSMSPORTAL] Detail fetch bounced to login - session expired.")
             return []
         soup = BeautifulSoup(response.text, 'html.parser')
         messages = []
@@ -8840,16 +8864,29 @@ if __name__ == "__main__":
         })
         logged_in = False
         first_run = True
+        last_login_ts = 0.0
         while True:
             try:
-                if not logged_in:
-                    logged_in = mysmsportal_login(ms_session)
-                    if not logged_in:
+                now_ts = time.time()
+                # Force a fresh login every 10 minutes - portal sessions expire silently.
+                # (Mid-cycle expiry is caught by the empty-fetch session check below.)
+                if not logged_in or (now_ts - last_login_ts) > 600:
+                    if logged_in:
+                        log("[MYSMSPORTAL] Session expired/stale - re-logging in...")
+                    logged_in = mysmsportal_login(ms_session, force=True)
+                    if logged_in:
+                        last_login_ts = time.time()
+                        log("[MYSMSPORTAL] Session active.")
+                    else:
                         log("[MYSMSPORTAL] Login failed, retrying in 60s...")
                         time.sleep(60)
                         continue
                 entries = mysmsportal_fetch_today(ms_session)
                 if not entries:
+                    # Empty result might mean session died mid-cycle - validate it.
+                    if not mysmsportal_session_valid(ms_session):
+                        logged_in = False
+                        log("[MYSMSPORTAL] Empty fetch + invalid session - will re-login next cycle.")
                     time.sleep(15)
                     continue
                 for entry in entries:
@@ -8872,6 +8909,7 @@ if __name__ == "__main__":
                         mysmsportal_seen.add(entry_id)
                         continue
                     # Process EVERY OTP through central processor (dedup + DM + group)
+                    log(f"[MYSMSPORTAL] New SMS for {entry.get('number')} ({entry.get('sender')}): {len(otps_found)} OTP(s) found")
                     for otp_code, sms_text in otps_found:
                         sms_data = {
                             'otp': otp_code,
