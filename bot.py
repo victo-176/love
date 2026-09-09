@@ -1581,22 +1581,23 @@ def choice_format_otp_message(sms):
         phone_match = re.search(r'(\+?\d{10,15})', sms.get('full_text', ''))
         if phone_match:
             phone = phone_match.group(1)
-    otp_clean = sms['otp']
+    otp_clean = str(sms.get('otp', '') or '').strip()
     full_text = re.sub(r'\s+', ' ', sms.get('full_text', '')).strip()
     timestamp = sms['timestamp']
     watermark = load_data().get("watermark", "VERTEX OTP")
     sep = "\u2501" * 13
-    return (
+    msg = (
         f"{watermark}\n"
         f"{sep}\n"
         f"{flag} 📱 {sms['service'].upper()} 🟢\n"
         f"📱 {phone}\n"
-        f"🔑 OTP: {otp_clean}\n"
-        f"Don't share this code with others\n"
-        f"⏰ {timestamp}\n"
-        f"{sep}\n"
-        f"<i>{html.escape(full_text[:200])}</i>"
     )
+    if otp_clean:
+        msg += f"🔑 OTP: {otp_clean}\nDon't share this code with others\n"
+    msg += f"⏰ {timestamp}\n{sep}\n"
+    if full_text:
+        msg += f"<i>{html.escape(full_text[:300])}</i>"
+    return msg
 
 def choice_monitor_tick():
     """One tick of the Choice SMS monitor - fetch OTPs and push through central processor."""
@@ -6656,18 +6657,28 @@ def process_otp(sms, panel_name):
     3. DM every active session matching the number (no break; session stays active).
     Returns True if the OTP was new (forwarded), False if it was a duplicate."""
     number = str(sms.get('number', '') or sms.get('phone', ''))
-    # Extract full number from full_text if available (fixes truncated number dedup)
+    # Extract full number from full_text if available - but NEVER let "Username: 12345"
+    # or "Password: 12345" style text hijack the phone number.
     _ft = str(sms.get("full_text", ""))
     _fn_match = re.search(r"(\d{10,15})", _ft)
-    if _fn_match and len(_fn_match.group(1)) > len(re.sub(r"\D", "", number)):
-        number = _fn_match.group(1)
-    otp_code = str(sms.get('otp', ''))
+    if _fn_match:
+        _ctx = _ft[max(0, _fn_match.start() - 30):_fn_match.start()].lower()
+        if not ('username' in _ctx or 'password' in _ctx or 'user:' in _ctx or 'pass:' in _ctx):
+            if len(_fn_match.group(1)) > len(re.sub(r"\D", "", number)):
+                number = _fn_match.group(1)
+    otp_code = str(sms.get('otp', '') or '').strip()
+    full_text = str(sms.get('full_text', '') or '').strip()
     service = str(sms.get('service', ''))
-    if not number or not otp_code:
+    if not number or (not otp_code and not full_text):
         return False
-    gkey = global_otp_hash(number, otp_code, service)
+    # Dedup: OTP-keyed when an OTP exists, otherwise keyed on the full message text
+    if otp_code:
+        gkey = global_otp_hash(number, otp_code, service)
+    else:
+        _digits_only = re.sub(r'\D', '', number)
+        gkey = hashlib.md5(f"TXT|{_digits_only}|{service}|{full_text}".encode()).hexdigest()
     if not check_and_mark_otp(gkey):
-        log(f"[{panel_name}] Duplicate OTP suppressed globally: {otp_code} -> {number}")
+        log(f"[{panel_name}] Duplicate SMS suppressed globally: {otp_code or full_text[:40]} -> {number}")
         return False
     save_global_seen_otp()
     # Build group message from panel-specific formatter when available
@@ -6679,21 +6690,28 @@ def process_otp(sms, panel_name):
         wm = load_data().get("watermark", "VERTEX OTP")
         digits = re.sub(r'\D', '', number)
         masked = ('+' + digits[:3] + '****' + digits[-4:]) if len(digits) > 7 else number
+        body = full_text
+        if len(body) > 800:
+            body = body[:800] + "\u2026"
         msg = (f"{wm}\n{sep}\n"
                f"\u300a \U0001f4f1 <b>NEW SMS RECEIVED</b> \u300b\n{sep}\n\n"
                f"\U0001f4de <b>Number:</b> <code>{masked}</code>\n"
-               f"\U0001f4e4 <b>Sender:</b> {html.escape(service or 'Unknown')}\n"
-               f"\U0001f511 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n"
-               f"{sep}")
+               f"\U0001f4e4 <b>Sender:</b> {html.escape(service or 'Unknown')}\n")
+        if otp_code:
+            msg += f"\U0001f511 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n"
+        if body:
+            msg += f"\n\U0001f4ac <b>Message:</b>\n{html.escape(body)}\n"
+        msg += sep
     forward_to_forward_groups(msg)
-    log(f"[{panel_name}] OTP forwarded once via central processor: {otp_code} -> {number}")
-    deliver_otp_dms(number, otp_code, panel_name)
+    log(f"[{panel_name}] SMS forwarded once via central processor: {otp_code or full_text[:40]} -> {number}")
+    deliver_otp_dms(number, otp_code, panel_name, full_text)
     return True
 
-def deliver_otp_dms(number, otp_code, panel_name):
-    """DM every active session whose number matches. NEVER breaks; resets status
-    to awaiting_otp so subsequent OTPs keep flowing to the same user.
-    Credits each user ONCE per OTP even if they have multiple matching sessions."""
+def deliver_otp_dms(number, otp_code, panel_name, full_text=""):
+    """DM every active session whose number matches. NO FILTER: delivers OTP and
+    plain-text messages alike. NEVER breaks; resets status to awaiting_otp so
+    subsequent messages keep flowing to the same user.
+    Credits each user ONCE per OTP (only when an OTP code exists)."""
     data = load_data()
     price = data.get("settings", {}).get("price_per_otp", 0.001)
     num_clean = re.sub(r'\D', '', number)
@@ -6712,11 +6730,12 @@ def deliver_otp_dms(number, otp_code, panel_name):
             continue
         matched += 1
         sess["status"] = "completed"
-        sess["otp_code"] = otp_code
+        if otp_code:
+            sess["otp_code"] = otp_code
         data.setdefault("number_session", {})[sid] = sess
         uid = str(sess.get("user_id"))
-        # Only credit each user ONCE per OTP
-        if uid not in credited_users:
+        # Only credit each user ONCE per OTP (plain texts deliver without credit)
+        if uid not in credited_users and otp_code:
             credited_users.add(uid)
             data.setdefault("balances", {})[uid] = data.get("balances", {}).get(uid, 0.0) + price
             data.setdefault("otp_counts", {})[uid] = data.get("otp_counts", {}).get(uid, 0) + 1
@@ -6725,22 +6744,27 @@ def deliver_otp_dms(number, otp_code, panel_name):
         # Only send DM once per user per OTP (skip if user already got a DM)
         if uid not in dm_sent:
             dm_sent.add(uid)
+            _body = str(full_text or "").strip()
+            if len(_body) > 600:
+                _body = _body[:600] + "\u2026"
             try:
-                bot.send_message(sess.get("user_id"),
-                    f"{sep}\n"
-                    f"\u300a \U0001f4f1 <b>NEW SMS RECEIVED</b> \u300b\n{sep}\n\n"
-                    f"\U0001f4de <b>Number:</b> <code>{sess_number}</code>\n"
-                    f"\U0001f511 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n\n"
-                    f"💰 <b>EARNED:</b> ${price:.4f}\n"
-                    f"💵 <b>BALANCE:</b> ${user_bal:.4f}\n"
-                    f"\u2705 <b>Auto-detected!</b>\n"
-                    f"{sep}",
-                    parse_mode="HTML")
+                _dm = (f"{sep}\n"
+                       f"\u300a \U0001f4f1 <b>NEW SMS RECEIVED</b> \u300b\n{sep}\n\n"
+                       f"\U0001f4de <b>Number:</b> <code>{sess_number}</code>\n")
+                if otp_code:
+                    _dm += f"\U0001f511 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n"
+                if _body:
+                    _dm += f"\n\U0001f4ac <b>Message:</b>\n{html.escape(_body)}\n"
+                _dm += (f"\n💰 <b>EARNED:</b> ${price:.4f}\n"
+                        f"💵 <b>BALANCE:</b> ${user_bal:.4f}\n"
+                        f"\u2705 <b>Auto-detected!</b>\n"
+                        f"{sep}")
+                bot.send_message(sess.get("user_id"), _dm, parse_mode="HTML")
             except Exception as e:
                 log(f"[{panel_name}] DM notify failed: {e}")
-        # Reset so the session can receive subsequent OTPs
+        # Reset so the session can receive subsequent messages
         sess["status"] = "awaiting_otp"
-        log(f"[{panel_name}] DM delivered: {otp_code} -> {sess_number} (user {uid})")
+        log(f"[{panel_name}] DM delivered: {otp_code or full_text[:40]} -> {sess_number} (user {uid})")
     if matched:
         save_data(data)
 
@@ -8898,26 +8922,25 @@ if __name__ == "__main__":
                         continue
                     # Fetch ALL message texts from mysmsportal
                     details_list = mysmsportal_fetch_otp(ms_session, entry['number'], entry['sender'])
-                    otps_found = []
-                    seen_codes = set()
-                    for details in details_list:
-                        m = re.search(r'\b(\d{4,6})\b', details)
-                        if m and m.group(1) not in seen_codes:
-                            seen_codes.add(m.group(1))
-                            otps_found.append((m.group(1), details))
-                    if not otps_found:
+                    if not details_list:
                         mysmsportal_seen.add(entry_id)
                         continue
-                    # Process EVERY OTP through central processor (dedup + DM + group)
-                    log(f"[MYSMSPORTAL] New SMS for {entry.get('number')} ({entry.get('sender')}): {len(otps_found)} OTP(s) found")
-                    for otp_code, sms_text in otps_found:
+                    # NO FILTER: process EVERY message - OTP codes AND plain texts
+                    # (username/password, payment notices, anything) go to group + DMs.
+                    log(f"[MYSMSPORTAL] New SMS for {entry.get('number')} ({entry.get('sender')}): {len(details_list)} message(s)")
+                    for sms_text in details_list:
+                        m = re.search(r'\b(\d{4,6})\b', sms_text)
+                        otp_code = m.group(1) if m else ""
+                        _now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         sms_data = {
                             'otp': otp_code,
                             'number': entry.get('number', ''),
                             'service': entry.get('sender', 'Unknown'),
                             'full_text': sms_text,
-                            'timestamp': entry.get('timestamp', datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                            'timestamp': entry.get('timestamp', _now),
                             'range': entry.get('sender', ''),
+                            '_formatter': lambda d, _n=entry.get('number', ''), _sv=entry.get('sender', 'Unknown'), _t=sms_text, _o=otp_code, _ts=_now: choice_format_otp_message({
+                                'number': _n, 'service': _sv, 'full_text': _t, 'otp': _o, 'timestamp': _ts}),
                         }
                         process_otp(sms_data, "MySmsPortal")
                     mysmsportal_seen.add(entry_id)
