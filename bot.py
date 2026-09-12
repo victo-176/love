@@ -6751,61 +6751,68 @@ def deliver_otp_dms(number, otp_code, panel_name, full_text=""):
     plain-text messages alike. NEVER breaks; resets status to awaiting_otp so
     subsequent messages keep flowing to the same user.
     Credits each user ONCE per OTP (only when an OTP code exists)."""
-    data = load_data()
-    price = data.get("settings", {}).get("price_per_otp", 0.001)
     num_clean = re.sub(r'\D', '', number)
     if not num_clean:
         return
     matched = 0
     credited_users = set()  # Track users already credited for this OTP
     dm_sent = set()  # Track users already DM'd for this OTP
-    for sid, sess in list(data.get("number_session", {}).items()):
-        # Treat completed sessions as still eligible: only skip cancelled/expired
-        if sess.get("status") in ("cancelled", "expired", "timeout"):
-            continue
-        sess_number = str(sess.get("number", ""))
-        sess_clean = re.sub(r'\D', '', sess_number)
-        if not sess_clean or not (sess_clean in num_clean or num_clean in sess_clean):
-            continue
-        matched += 1
-        sess["status"] = "completed"
-        if otp_code:
-            sess["otp_code"] = otp_code
-        data.setdefault("number_session", {})[sid] = sess
-        uid = str(sess.get("user_id"))
-        # Only credit each user ONCE per OTP (plain texts deliver without credit)
-        if uid not in credited_users and otp_code:
-            credited_users.add(uid)
-            data.setdefault("balances", {})[uid] = data.get("balances", {}).get(uid, 0.0) + price
-            data.setdefault("otp_counts", {})[uid] = data.get("otp_counts", {}).get(uid, 0) + 1
-        sep = "\u2501" * 13
-        user_bal = data.get("balances", {}).get(uid, 0.0)
-        # Only send DM once per user per OTP (skip if user already got a DM)
-        if uid not in dm_sent:
-            dm_sent.add(uid)
-            _body = str(full_text or "").strip()
-            if len(_body) > 600:
-                _body = _body[:600] + "\u2026"
-            try:
-                _dm = (f"{sep}\n"
-                       f"\u300a \U0001f4f1 <b>NEW SMS RECEIVED</b> \u300b\n{sep}\n\n"
-                       f"\U0001f4de <b>Number:</b> <code>{sess_number}</code>\n")
-                if otp_code:
-                    _dm += f"\U0001f511 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n"
-                if _body:
-                    _dm += f"\n\U0001f4ac <b>Message:</b>\n{html.escape(_body)}\n"
-                _dm += (f"\n💰 <b>EARNED:</b> ${price:.4f}\n"
-                        f"💵 <b>BALANCE:</b> ${user_bal:.4f}\n"
-                        f"\u2705 <b>Auto-detected!</b>\n"
-                        f"{sep}")
-                bot.send_message(sess.get("user_id"), _dm, parse_mode="HTML")
-            except Exception as e:
-                log(f"[{panel_name}] DM notify failed: {e}")
-        # Reset so the session can receive subsequent messages
-        sess["status"] = "awaiting_otp"
-        log(f"[{panel_name}] DM delivered: {otp_code or full_text[:40]} -> {sess_number} (user {uid})")
-    if matched:
-        save_data(data)
+    credited_uids = []  # users credited in this pass (for logging)
+    # Hold the lock across load -> modify -> save so concurrent monitor threads
+    # (portal / Choice / EVS) can never overwrite each other's balance credits.
+    with data_lock:
+        data = load_data()
+        price = data.get("settings", {}).get("price_per_otp", 0.001)
+        for sid, sess in list(data.get("number_session", {}).items()):
+            # Treat completed sessions as still eligible: only skip cancelled/expired
+            if sess.get("status") in ("cancelled", "expired", "timeout"):
+                continue
+            sess_number = str(sess.get("number", ""))
+            sess_clean = re.sub(r'\D', '', sess_number)
+            if not sess_clean or not (sess_clean in num_clean or num_clean in sess_clean):
+                continue
+            matched += 1
+            sess["status"] = "completed"
+            if otp_code:
+                sess["otp_code"] = otp_code
+            data.setdefault("number_session", {})[sid] = sess
+            uid = str(sess.get("user_id"))
+            # Only credit each user ONCE per OTP (plain texts deliver without credit)
+            if uid not in credited_users and otp_code:
+                credited_users.add(uid)
+                data.setdefault("balances", {})[uid] = round(data.get("balances", {}).get(uid, 0.0) + price, 6)
+                data.setdefault("otp_counts", {})[uid] = data.get("otp_counts", {}).get(uid, 0) + 1
+                credited_uids.append(uid)
+            sep = "\u2501" * 13
+            user_bal = data.get("balances", {}).get(uid, 0.0)
+            # Only send DM once per user per OTP (skip if user already got a DM)
+            if uid not in dm_sent:
+                dm_sent.add(uid)
+                _body = str(full_text or "").strip()
+                if len(_body) > 600:
+                    _body = _body[:600] + "\u2026"
+                try:
+                    _dm = (f"{sep}\n"
+                           f"\u300a \U0001f4f1 <b>NEW SMS RECEIVED</b> \u300b\n{sep}\n\n"
+                           f"\U0001f4de <b>Number:</b> <code>{sess_number}</code>\n")
+                    if otp_code:
+                        _dm += f"\U0001f511 <b>OTP:</b> <code>{html.escape(otp_code)}</code>\n"
+                    if _body:
+                        _dm += f"\n\U0001f4ac <b>Message:</b>\n{html.escape(_body)}\n"
+                    _dm += (f"\n💰 <b>EARNED:</b> ${price:.4f}\n"
+                            f"💵 <b>BALANCE:</b> ${user_bal:.4f}\n"
+                            f"\u2705 <b>Auto-detected!</b>\n"
+                            f"{sep}")
+                    bot.send_message(sess.get("user_id"), _dm, parse_mode="HTML")
+                except Exception as e:
+                    log(f"[{panel_name}] DM notify failed: {e}")
+            # Reset so the session can receive subsequent messages
+            sess["status"] = "awaiting_otp"
+            log(f"[{panel_name}] DM delivered: {otp_code or full_text[:40]} -> {sess_number} (user {uid})")
+        if matched:
+            save_data(data)
+        for _uid in credited_uids:
+            log(f"[BALANCE] Credited user {_uid} ${price:.4f} (new balance: ${data.get('balances', {}).get(_uid, 0.0):.4f})")
 
 
 def forward_to_forward_groups(text, dedup_key=None):
