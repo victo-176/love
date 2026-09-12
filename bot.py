@@ -3506,9 +3506,10 @@ def show_user_services(chat_id):
     price = st.get("price_per_otp", 0.001)
     data_wm = data.get("watermark", "EARNINGWITHSIMPLETASK")
 
-    # Collect services from combos only
+    # Collect services from combos AND panel ranges (panels are the main stock source now)
     all_services = []
     seen = set()
+    active_sessions = set(get_all_active_session_numbers())
     for combo in data.get("combos", []):
         name = combo.get("name", "")
         if name and name.upper() not in seen:
@@ -3516,6 +3517,19 @@ def show_user_services(chat_id):
             if avail > 0:
                 all_services.append({"name": name, "count": avail, "type": "combo"})
                 seen.add(name.upper())
+    for panel in data.get("panels", {}).values():
+        if panel.get("status") != "active":
+            continue
+        for rng in panel.get("ranges", {}).values():
+            app = (rng.get("app") or "").strip()
+            if not app or app.upper() in seen:
+                continue
+            nums = rng.get("numbers", [])
+            used = rng.get("used_numbers", [])
+            avail = len([n for n in nums if n not in used and re.sub(r'\D', '', n) not in active_sessions])
+            if avail > 0:
+                all_services.append({"name": app, "count": avail, "type": "panel"})
+                seen.add(app.upper())
 
     markup = InlineKeyboardMarkup(row_width=1)
     if all_services:
@@ -3584,7 +3598,24 @@ def show_user_service_countries(chat_id, service_name, message_id=None):
     """Show countries for a selected service (from combos)."""
     data = load_data()
     countries = {}
-    # From combos only
+    active_sessions = set(get_all_active_session_numbers())
+    # From panel ranges
+    for panel in data.get("panels", {}).values():
+        if panel.get("status") != "active":
+            continue
+        for rng in panel.get("ranges", {}).values():
+            if (rng.get("app") or "").upper() != service_name.upper():
+                continue
+            rng_name = rng.get("name", "Unknown")
+            nums = rng.get("numbers", [])
+            used = rng.get("used_numbers", [])
+            avail = len([n for n in nums if n not in used and re.sub(r'\D', '', n) not in active_sessions])
+            if avail > 0:
+                key = rng_name.lower()
+                if key not in countries:
+                    countries[key] = {"name": rng_name, "count": 0}
+                countries[key]["count"] += avail
+    # From combos
     for combo in data.get("combos", []):
         if combo.get("name", "").upper() != service_name.upper():
             continue
