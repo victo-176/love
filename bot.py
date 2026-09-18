@@ -1866,6 +1866,257 @@ def show_choice_panel_menu(chat_id, message_id=None):
     )
     safe_send(chat_id, text, markup)
 
+# ==================== NUMBER PANEL (TEMPNUMBERS.NET) OTP MONITOR ====================
+NUMBERPANEL_DEFAULT_CONFIG = {
+    "enabled": True,
+    "username": "Seagold20",
+    "password": "Seagold20",
+    "panel_url": "http://tempnumbers.net",
+    "stats_url": "http://tempnumbers.net/client/SMSCDRStats",
+    "export_url": "http://tempnumbers.net/client/res/exportsmscdr",
+    "panel_type": "client",
+    "poll_interval": 15,
+}
+
+_np_session = requests.Session()
+_np_session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+})
+_np_logged_in = False
+_np_last_hashes = set()
+_np_primed = False
+
+def np_login(panel_cfg=None):
+    """Login to tempnumbers.net (Number Panel, client account). Returns True on success."""
+    global _np_logged_in
+    data = load_data()
+    cfg = panel_cfg or data.get("number_panel", {}) or NUMBERPANEL_DEFAULT_CONFIG
+    username = cfg.get("username", "")
+    password = cfg.get("password", "")
+    base = cfg.get("panel_url", "http://tempnumbers.net").rstrip("/")
+    if not username or not password:
+        log("[NUMPANEL] No username/password set")
+        return False
+    try:
+        _np_session.cookies.clear()
+        resp = _np_session.get(f"{base}/login", timeout=30)
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        # The real captcha lives in the #captcha-question element
+        q = soup.find(id='captcha-question')
+        login_data = {'username': username, 'password': password, 'remember-me': '1'}
+        if q:
+            qt = q.get_text(" ", strip=True)
+            nums = re.findall(r'(\d+)\s*\+\s*(\d+)', qt)
+            if nums:
+                n1, n2 = nums[0]
+                login_data['capt'] = str(int(n1) + int(n2))
+                log(f"[NUMPANEL] Captcha solved: {n1} + {n2}")
+        resp2 = _np_session.post(f"{base}/signin", data=login_data, timeout=30,
+                                 allow_redirects=True)
+        if "login" not in resp2.url.lower() and "signin" not in resp2.url.lower():
+            _np_logged_in = True
+            log("[NUMPANEL] Login successful (client)")
+            return True
+        # Show the error reason if present
+        try:
+            err = re.search(r'Error[^<]{0,80}', resp2.text)
+            log(f"[NUMPANEL] Login failed: {err.group(0).strip() if err else resp2.url}")
+        except Exception:
+            log(f"[NUMPANEL] Login failed: {resp2.url}")
+        return False
+    except Exception as e:
+        log(f"[NUMPANEL] Login error: {e}")
+        return False
+
+def _np_get_sesskey(stats_url):
+    """Fetch the SMSCDRStats page and extract the numeric sesskey."""
+    resp = _np_session.get(stats_url, timeout=30)
+    if "login" in resp.url.lower() or "signin" in resp.url.lower():
+        return None
+    m = re.search(r'res/data_smscdr\.php\?[^"\']*?sesskey=([0-9A-Za-z]+)', resp.text)
+    if not m:
+        m = re.search(r'sesskey=([0-9A-Za-z]+)', resp.text)
+    return m.group(1) if m else None
+
+def np_fetch_otps(panel_cfg=None):
+    """Fetch messages from the Number Panel export endpoint (CSV).
+    The data_smscdr.php endpoint returns an empty body on this panel;
+    /client/res/exportsmscdr returns the full CDR rows."""
+    global _np_last_hashes, _np_logged_in, _np_primed
+    data = load_data()
+    cfg = panel_cfg or data.get("number_panel", {}) or NUMBERPANEL_DEFAULT_CONFIG
+    base = cfg.get("panel_url", "http://tempnumbers.net").rstrip("/")
+    stats_url = cfg.get("stats_url", f"{base}/client/SMSCDRStats")
+    export_url = cfg.get("export_url", f"{base}/client/res/exportsmscdr")
+    messages = []
+    try:
+        if not _np_logged_in:
+            if not np_login(cfg):
+                return []
+        from datetime import timedelta as _td
+        sesskey = _np_get_sesskey(stats_url)
+        if sesskey is None:
+            _np_logged_in = False
+            log("[NUMPANEL] Session expired, re-logging in...")
+            if not np_login(cfg):
+                return []
+            sesskey = _np_get_sesskey(stats_url)
+            if sesskey is None:
+                return []
+        today = datetime.now().strftime("%Y-%m-%d")
+        yesterday = (datetime.now() - _td(days=1)).strftime("%Y-%m-%d")
+        lines = []
+        for date in [today, yesterday]:
+            params = {
+                "fdate1": f"{date} 00:00:00", "fdate2": f"{date} 23:59:59",
+                "frange": "", "fnum": "", "fcli": "",
+                "fgdate": "", "fgmonth": "", "fgrange": "", "fgnumber": "",
+                "fgcli": "", "fg": "0",
+                "sesskey": sesskey,
+            }
+            resp = _np_session.get(export_url, params=params, timeout=30)
+            if resp.status_code != 200 or "login" in resp.url.lower():
+                _np_logged_in = False
+                log(f"[NUMPANEL] Export failed (HTTP {resp.status_code}), re-logging in...")
+                np_login(cfg)
+                continue
+            if resp.text.strip():
+                lines.extend(resp.text.splitlines())
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            # CSV rows start with the date; header/summary rows are skipped
+            if not re.match(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}, ', line):
+                continue
+            parts = line.split(", ")
+            if len(parts) < 7:
+                continue
+            timestamp = parts[0]
+            range_name = parts[1]
+            number = re.sub(r"\D", "", parts[2])
+            service = parts[3] or "Unknown"
+            full_text = ", ".join(parts[4:-2]).strip()
+            if not full_text or len(number) < 7:
+                continue
+            # Phone-hijack guard (username/password text must not change the number)
+            full_number_match = re.search(r'(\d{10,15})', full_text)
+            if full_number_match:
+                _ctx = full_text[max(0, full_number_match.start() - 30):full_number_match.start()].lower()
+                if not ('username' in _ctx or 'password' in _ctx or 'user:' in _ctx or 'pass:' in _ctx):
+                    full_num = full_number_match.group(1)
+                    if len(full_num) > len(number):
+                        number = full_num
+            otp_match = re.search(r'code\s*[:]?\s*([A-Za-z0-9]{4,8})\b', full_text, re.IGNORECASE)
+            if not otp_match:
+                otp_match = re.search(r'\b(\d{4,6})\b', full_text)
+            otp = otp_match.group(1) if otp_match else ""
+            # NO FILTER: keep every message - OTP codes AND plain texts
+            if otp:
+                sms_id = hashlib.md5((number + otp).encode()).hexdigest()
+            else:
+                sms_id = hashlib.md5(("TXT|" + number + "|" + service + "|" + full_text).encode()).hexdigest()
+            if sms_id not in _np_last_hashes:
+                _np_last_hashes.add(sms_id)
+                messages.append({
+                    'otp': otp, 'service': service,
+                    'full_text': full_text, 'timestamp': timestamp,
+                    'range': range_name, 'number': number
+                })
+        if not _np_primed:
+            # First fetch after start: memorize history without re-sending it
+            _np_primed = True
+            return []
+        if messages:
+            log(f"[NUMPANEL] Found {len(messages)} new message(s)")
+    except Exception as e:
+        log(f"[NUMPANEL] Fetch error: {e}")
+        _np_logged_in = False
+    return messages
+
+def np_format_otp_message(sms):
+    """Format Number Panel OTP message for the OTP group."""
+    country = "Unknown"
+    if sms.get('range'):
+        parts = sms['range'].split()
+        if parts:
+            country = parts[0].upper()
+    if country == "Unknown":
+        country = _extract_country_scraped(sms.get('full_text', '') + ' ' + sms.get('number', ''))
+    flag = COUNTRY_FLAGS_SCRAPED.get(country, '\U0001F30D')
+    phone = sms.get('number', 'N/A')
+    if not phone or phone == 'N/A':
+        phone_match = re.search(r'(\+?\d{10,15})', sms.get('full_text', ''))
+        if phone_match:
+            phone = phone_match.group(1)
+    otp_clean = str(sms.get('otp', '') or '').strip()
+    full_text = re.sub(r'\s+', ' ', sms.get('full_text', '')).strip()
+    timestamp = sms['timestamp']
+    watermark = load_data().get("watermark", "VERTEX OTP")
+    sep = "\u2501" * 13
+    msg = (
+        f"{watermark}\n"
+        f"{sep}\n"
+        f"{flag} \U0001F4F1 {sms['service'].upper()} \U0001F7E2\n"
+        f"\U0001F4F1 {phone}\n"
+    )
+    if otp_clean:
+        msg += f"\U0001F511 OTP: {otp_clean}\nDon't share this code with others\n"
+    msg += f"\u23F0 {timestamp}\n{sep}\n"
+    if full_text:
+        msg += f"<i>{html.escape(full_text[:300])}</i>"
+    return msg
+
+def np_monitor_tick():
+    """One tick of the Number Panel monitor - fetch and push through central processor."""
+    data = load_data()
+    np_cfg = data.get("number_panel", {})
+    if not np_cfg:
+        np_cfg = dict(NUMBERPANEL_DEFAULT_CONFIG)
+    if not np_cfg.get("enabled"):
+        return
+    if not np_cfg.get("username") or not np_cfg.get("password"):
+        np_cfg = dict(NUMBERPANEL_DEFAULT_CONFIG)
+    messages = np_fetch_otps(np_cfg)
+    if not messages:
+        return
+    for sms in messages:
+        sms['_formatter'] = np_format_otp_message
+        process_otp(sms, "Number Panel")
+
+def show_np_panel_menu(chat_id, message_id=None):
+    """Show Number Panel (tempnumbers.net) admin menu."""
+    data = load_data()
+    np_cfg = data.get("number_panel", {})
+    if not np_cfg:
+        np_cfg = dict(NUMBERPANEL_DEFAULT_CONFIG)
+        data["number_panel"] = np_cfg
+        save_data(data)
+    enabled = np_cfg.get("enabled", False)
+    username = np_cfg.get("username", "")
+    status = "\U0001F7E2 ACTIVE" if enabled else "\U0001F534 DISABLED"
+    user_status = f"\U0001F464 {username}" if username else "\u274C Not set"
+    markup = InlineKeyboardMarkup(row_width=2)
+    toggle_text = "\U0001F534 DISABLE" if enabled else "\U0001F7E2 ENABLE"
+    toggle_style = "danger" if enabled else "success"
+    markup.add(ibtn(f"\u26A1 {toggle_text}", callback_data="np_toggle", style=toggle_style))
+    markup.add(ibtn("\U0001F464 SET CREDENTIALS", callback_data="np_set_creds", style="primary"))
+    markup.add(ibtn("\U0001F9EA TEST CONNECTION", callback_data="np_test", style="success"),
+               ibtn("\U0001F519 BACK", callback_data="back_to_admin", style="primary"))
+    text = (
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"\u300A \U0001F522 <b>NUMBER PANEL (TEMPNUMBERS)</b> \u300B\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+        f"\U0001F4CA <b>Status:</b> {status}\n"
+        f"\U0001F464 <b>Credentials:</b> {user_status}\n"
+        f"\U0001F517 <b>Panel:</b> <code>{html.escape(np_cfg.get('panel_url', 'Not set'))}</code>\n"
+        f"\U0001F916 <b>Type:</b> CLIENT\n"
+        f"\u23F1 <b>Poll Interval:</b> {np_cfg.get('poll_interval', 15)}s\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+    )
+    safe_send(chat_id, text, markup)
+
 # ==================== EVS PANEL OTP MONITOR ====================
 _evs_session = requests.Session()
 _evs_session.headers.update({
@@ -3064,6 +3315,7 @@ def get_admin_menu(user_id):
                ibtn("📱 ALL NUMBERS", callback_data="admin_all_numbers", style="primary"))
     markup.add(ibtn("⚡ EVS PANEL", callback_data="admin_choice_panel", style="danger"))
     markup.add(ibtn("\u26a1 EVS PANEL", callback_data="admin_evs_panel", style="danger"))
+    markup.add(ibtn("\U0001F522 NUMBER PANEL", callback_data="admin_np_panel", style="danger"))
     markup.add(ibtn("🚫 BLACKLIST", callback_data="admin_blacklist", style="danger"),
                ibtn("🛡️ ANTI-SPAM", callback_data="admin_anti_spam", style="primary"))
     if is_main_admin(user_id):
@@ -6545,6 +6797,59 @@ def callback_handler(call):
             return
         show_choice_panel_menu(chat_id, message_id)
 
+    # ============ NUMBER PANEL (TEMPNUMBERS) ============
+    elif data == "np_toggle":
+        bot.answer_callback_query(call.id)
+        if not is_admin(chat_id):
+            return
+        d = load_data()
+        np_cfg = d.get("number_panel", {})
+        if not np_cfg:
+            np_cfg = dict(NUMBERPANEL_DEFAULT_CONFIG)
+        np_cfg["enabled"] = not np_cfg.get("enabled", False)
+        d["number_panel"] = np_cfg
+        save_data(d)
+        status = "\U0001F7E2 ENABLED" if np_cfg["enabled"] else "\U0001F534 DISABLED"
+        bot.answer_callback_query(call.id, f"Number Panel: {status}")
+        show_np_panel_menu(chat_id, message_id)
+
+    elif data == "np_set_creds":
+        bot.answer_callback_query(call.id)
+        if not is_admin(chat_id):
+            return
+        user_states[chat_id] = {"state": "np_set_username"}
+        safe_send(chat_id, "\U0001F464 <b>ENTER NUMBER PANEL USERNAME:</b>\n<i>Login username for tempnumbers.net (client account)</i>\n\n\u274C /cancel to cancel")
+
+    elif data == "np_test":
+        bot.answer_callback_query(call.id)
+        if not is_admin(chat_id):
+            return
+        safe_send(chat_id, "\U0001F9EA <b>TESTING NUMBER PANEL...</b>")
+        d = load_data()
+        np_cfg = d.get("number_panel", {}) or NUMBERPANEL_DEFAULT_CONFIG
+        if not np_cfg.get("username") or not np_cfg.get("password"):
+            safe_send(chat_id, "\u274C <b>SET USERNAME AND PASSWORD FIRST</b>")
+            return
+        ok = np_login(np_cfg)
+        if ok:
+            msgs = np_fetch_otps(np_cfg)
+            safe_send(chat_id,
+                f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+                f"\u2705 <b>NUMBER PANEL OK!</b>\n"
+                f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+                f"\U0001F510 <b>Login:</b> \u2705\n"
+                f"\U0001F916 <b>Type:</b> CLIENT\n"
+                f"\U0001F4F1 <b>Messages Found:</b> {len(msgs)}\n"
+                f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501")
+        else:
+            safe_send(chat_id, "\u274C <b>NUMBER PANEL CONNECTION FAILED!</b>\nCheck username and password.")
+
+    elif data == "admin_np_panel":
+        bot.answer_callback_query(call.id)
+        if not is_admin(chat_id):
+            return
+        show_np_panel_menu(chat_id, message_id)
+
     # ============ EVS PANEL ============
     elif data == "evs_toggle":
         bot.answer_callback_query(call.id)
@@ -9012,6 +9317,35 @@ def text_handler(message):
             show_choice_panel_menu(chat_id)
             return
 
+        if s == "np_set_username":
+            d = load_data()
+            np_cfg = d.get("number_panel", {}) or dict(NUMBERPANEL_DEFAULT_CONFIG)
+            np_cfg["username"] = text.strip()
+            d["number_panel"] = np_cfg
+            save_data(d)
+            user_states[chat_id] = {"state": "np_set_password"}
+            safe_send(chat_id, f"\u2705 <b>USERNAME SET:</b> {html.escape(text.strip())}\n\n\U0001F511 <b>NOW ENTER PASSWORD:</b>\n\n\u274C /cancel to cancel")
+            return
+
+        if s == "np_set_password":
+            d = load_data()
+            np_cfg = d.get("number_panel", {}) or dict(NUMBERPANEL_DEFAULT_CONFIG)
+            np_cfg["password"] = text.strip()
+            d["number_panel"] = np_cfg
+            save_data(d)
+            user_states.pop(chat_id, None)
+            safe_send(chat_id,
+                f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+                f"\u2705 <b>NUMBER PANEL CREDENTIALS SET!</b>\n"
+                f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+                f"\U0001F464 <b>Username:</b> {html.escape(np_cfg.get('username', ''))}\n"
+                f"\U0001F511 <b>Password:</b> \u2705\n"
+                f"\U0001F916 <b>Type:</b> CLIENT\n"
+                f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+                f"\U0001F4A1 <b>Click ENABLE to start monitoring</b>")
+            show_np_panel_menu(chat_id)
+            return
+
         # ---- EVS SET USERNAME ----
         if s == "evs_set_username":
             d = load_data()
@@ -9231,6 +9565,18 @@ if __name__ == "__main__":
     _choice_t = threading.Thread(target=_choice_monitor, daemon=True)
     _choice_t.start()
     log("[CHOICE MONITOR] Background started (15s)")
+
+    # Number Panel (tempnumbers.net) monitor (client account)
+    def _np_monitor():
+        while True:
+            try:
+                np_monitor_tick()
+            except Exception as e:
+                log(f"[NUMPANEL MONITOR ERROR] {e}")
+            time.sleep(15)
+    _np_t = threading.Thread(target=_np_monitor, daemon=True)
+    _np_t.start()
+    log("[NUMPANEL MONITOR] Background started (15s)")
 
     # Mysmsportal OTP monitor
     load_mysmsportal_seen()
