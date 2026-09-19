@@ -103,12 +103,12 @@ def rbtn(text, style=None):
 # ============================================
 
 # --- CONFIGURATION ---
-TOKEN = "8197426033:AAHyvcU2MxyzvEaQal9cH2uB9bqzxjRoaD8"
+TOKEN = "8197426033:AAHfjqQuaU5LJzya2kMBtXTD_vcRL5p46vQ"
 
 bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=50)
 
 # --- OTP BOT (for forwarding to OTP groups) ---
-OTP_BOT_TOKEN = "8197426033:AAHyvcU2MxyzvEaQal9cH2uB9bqzxjRoaD8"
+OTP_BOT_TOKEN = "8197426033:AAHfjqQuaU5LJzya2kMBtXTD_vcRL5p46vQ"
 try:
     otp_bot = telebot.TeleBot(OTP_BOT_TOKEN, threaded=False)
 except Exception:
