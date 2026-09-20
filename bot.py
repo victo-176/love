@@ -4167,7 +4167,7 @@ def format_message(date_str, number, sms, flag_html, app_emoji):
     )
 
 def send_to_telegram_group(text, otp_code, number):
-    bot_link = get_setting('bot_link') or 'https://t.me/Meuusho_bot'
+    bot_link = get_setting('bot_link') or 'https://t.me/EARNINGWITHSIMPLETASK'
     kb = {"inline_keyboard": [[
         {"text": "📋 Copy OTP", "callback_data": f"copy_{otp_code}"},
         {"text": "🤖 BOT LINK", "url": bot_link}
@@ -4590,7 +4590,7 @@ class ChoiceSMSForwarder:
                         continue
                     mark_otp_seen(uid)
                     # Forward the OTP
-                    bot_link = get_setting('bot_link') or 'https://t.me/Meuusho_bot'
+                    bot_link = get_setting('bot_link') or 'https://t.me/EARNINGWITHSIMPLETASK'
                     full_clean = self._clean_text(sms['full_text'])[:200]
                     masked = self._mask_number(sms['phone'])
                     cflag = country_flag(sms['country'])
@@ -6090,7 +6090,7 @@ class SMSPanelForwarder:
                         continue
                     mark_otp_seen(uid_key)
 
-                    bot_link = get_setting('bot_link') or 'https://t.me/Meuusho_bot'
+                    bot_link = get_setting('bot_link') or 'https://t.me/EARNINGWITHSIMPLETASK'
                     full_clean = self._clean_text(sms['full_text'])[:200]
                     masked = self._mask_number(sms['phone'])
                     cflag = country_flag(sms['country'])
