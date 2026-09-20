@@ -51,7 +51,7 @@ except ImportError:
 # =========================== CONFIGURATION ===========================
 # Bot token stored base64-encoded to avoid a plain-text token in source.
 # Decodes to the bot token; env var BOT_TOKEN overrides it.
-_BOT_TOKEN_ENC = "QUFGYjFiME1TR2tiRnV6S09MdFYxWVVWTjY3cm43ZW5ZVQ=="
+_BOT_TOKEN_ENC = "ODE5NzQyNjAzMzpBQUZiMWIwTVNHa2JGdXpLT0x0NlYxWVVWTjY3cm43ZW5ZVQ=="
 BOT_TOKEN = os.getenv("BOT_TOKEN") or base64.b64decode(_BOT_TOKEN_ENC).decode("utf-8")
 
 # Temp email services - free, no API key required.

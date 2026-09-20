@@ -135,7 +135,7 @@ def get_setting(key, default=None):
         return default
 
 
-_BOT_TOKEN_ENC = "QUFGYjFiME1TR2tiRnV6S09MdFYxWVVWTjY3cm43ZW5ZVQ=="
+_BOT_TOKEN_ENC = "ODE5NzQyNjAzMzpBQUZiMWIwTVNHa2JGdXpLT0x0NlYxWVVWTjY3cm43ZW5ZVQ=="
 
 
 def get_bot_token():
