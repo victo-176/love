@@ -922,7 +922,7 @@ def process_otp(sms, panel_name=""):
                 app_emoji = app_emoji_html(service)
                 markup = types.InlineKeyboardMarkup()
                 markup.row(ibtn("Owner", url="https://t.me/UNSTOPPABLEPLUS001", style="primary", icon="admin"),
-                           ibtn("Channel", url="https://t.me/Urnameismynamebot", style="primary", icon="announcement"))
+                           ibtn("Channel", url="https://t.me/EARNINGWITHSIMPLETASK", style="primary", icon="announcement"))
                 try:
                     cur_bal_v = (get_user(uid)[10] if get_user(uid) and len(get_user(uid)) > 10 else 0.0) or 0.0
                 except Exception:
@@ -1425,7 +1425,11 @@ def evs_fetch_otps(panel_cfg=None):
             try:
                 resp_data = resp.json()
             except Exception:
-                logger.error(f"[EVS] Non-JSON API response ({date}) - body: {resp.text[:200]}")
+                body_preview = resp.text[:200] if resp.text else ""
+                if 'direct script access' in body_preview.lower():
+                    logger.warning("[EVS] Panel blocks direct access - stopping EVS")
+                    return []
+                logger.error(f"[EVS] Non-JSON API response ({date}) - body: {body_preview[:80]}")
                 _evs_logged_in = False  # session expired or panel returning HTML
                 continue
             records = resp_data.get("aaData", []) if isinstance(resp_data, dict) else []
@@ -1530,11 +1534,19 @@ def evs_monitor_tick():
 def evs_monitor_tick_loop():
     """Background loop running evs_monitor_tick every 15 seconds."""
     logger.info("[EVS MONITOR] Background thread started (15s)")
+    consecutive_failures = 0
     while True:
         try:
             evs_monitor_tick()
+            consecutive_failures = 0  # reset on success
         except Exception as e:
-            logger.error(f"[EVS MONITOR ERROR] {e}", exc_info=True)
+            consecutive_failures += 1
+            logger.error(f"[EVS MONITOR ERROR] {e}")
+            if consecutive_failures >= 20:
+                logger.warning("[EVS MONITOR] Too many consecutive failures, backing off for 5 minutes")
+                time.sleep(300)
+                consecutive_failures = 0
+                continue
         time.sleep(15)
 
 
@@ -4116,7 +4128,7 @@ def send_otp_to_user_and_group(date_str, number, sms, app_name=None):
         try:
             markup = types.InlineKeyboardMarkup()
             markup.row(ibtn("Owner", url="https://t.me/UNSTOPPABLEPLUS001", style="primary", icon="admin"),
-                       ibtn("Channel", url="https://t.me/Urnameismynamebot", style="primary", icon="announcement"))
+                       ibtn("Channel", url="https://t.me/EARNINGWITHSIMPLETASK", style="primary", icon="announcement"))
             msg = (f"{pe('fire', '🏆')} <b>EARNINGWITHSIMPLETASK</b> {pe('fire', '🏆')}\n"
                    f"{flag_emoji_html(iso)} <b>Country:</b> {html_mod.escape(str(country_name))}\n"
                    f"{app_emoji} <b>Service:</b> {html_mod.escape(str(service))}\n"
@@ -4167,7 +4179,7 @@ def format_message(date_str, number, sms, flag_html, app_emoji):
     )
 
 def send_to_telegram_group(text, otp_code, number):
-    bot_link = get_setting('bot_link') or 'https://t.me/Urnameismynamebot'
+    bot_link = get_setting('bot_link') or 'https://t.me/EARNINGWITHSIMPLETASK'
     kb = {"inline_keyboard": [[
         {"text": "📋 Copy OTP", "callback_data": f"copy_{otp_code}"},
         {"text": "🤖 BOT LINK", "url": bot_link}
@@ -4257,6 +4269,7 @@ class ChoiceSMSForwarder:
             'Accept': 'application/json, text/javascript, */*',
         })
         self.running = False
+        self._cached_sesskey = None
 
     def _save_sesskey(self):
         """Persist sesskey to disk."""
@@ -4453,7 +4466,7 @@ class ChoiceSMSForwarder:
                 if m:
                     return m.group(1)
             # FIXED: Try /client/SMSCDRStats and /agent/SMSCDRStats as fallback
-            for fallback_page in ['/client/SMSCDRStats', '/agent/SMSCDRStats', '/dashboard']:
+            for fallback_page in ['/client/SMSCDRStats', '/agent/SMSCDRStats', '/dashboard', '/client/SMSCDRStats/', '/agent/SMSCDRStats/', '/home']:
                 try:
                     resp2 = self.session.get(f"{panel_url}{fallback_page}", timeout=30)
                     if 'login' not in resp2.url.lower():
@@ -4500,6 +4513,7 @@ class ChoiceSMSForwarder:
                 return sk
             # Login succeeded but no sesskey - try API without sesskey
             logger.info("Choice SMS: Login OK, no sesskey (will try API without)")
+            time.sleep(2)  # avoid tight retry loop
             return ""
         return None
 
@@ -4534,6 +4548,13 @@ class ChoiceSMSForwarder:
                     if 'login' in resp.url.lower() or 'signin' in resp.url.lower():
                         logger.error("Choice SMS: Still redirected after re-login")
                         return []
+            # Check for "Direct Script Access Not Allowed" in response body
+            if 'direct script access' in resp.text.lower():
+                logger.warning("Choice SMS: Panel blocks direct access, clearing session")
+                self._cached_sesskey = None
+                self._save_sesskey()
+                time.sleep(60)  # long wait for panel to recover
+                return []
             if resp.status_code != 200:
                 logger.error(f"Choice SMS: API status {resp.status_code} (body: {resp.text[:200]})")
                 # 503 means sesskey invalid - clear and re-login
@@ -4549,6 +4570,13 @@ class ChoiceSMSForwarder:
                             return []
                 else:
                     return []
+            # Check if response is HTML instead of JSON
+            if resp.text.strip().startswith('<!') or resp.text.strip().startswith('<h'):
+                logger.warning("Choice SMS: Got HTML response instead of JSON, clearing session")
+                self._cached_sesskey = None
+                self._save_sesskey()
+                time.sleep(30)
+                return []
             data = resp.json()
             records = data.get('data') or data.get('aaData') or []
             if isinstance(data, list):
@@ -4565,6 +4593,10 @@ class ChoiceSMSForwarder:
             # On ANY error, clear sesskey so we re-login next cycle
             self._cached_sesskey = None
             self._save_sesskey()
+            # If response was HTML (Direct Script Access), wait before retry
+            if 'direct script access' in str(e).lower() or 'expecting value' in str(e).lower():
+                logger.warning("Choice SMS: Panel returned non-JSON, waiting 30s before retry")
+                time.sleep(30)
             return []
 
     def run(self):
@@ -4590,7 +4622,7 @@ class ChoiceSMSForwarder:
                         continue
                     mark_otp_seen(uid)
                     # Forward the OTP
-                    bot_link = get_setting('bot_link') or 'https://t.me/Urnameismynamebot'
+                    bot_link = get_setting('bot_link') or 'https://t.me/EARNINGWITHSIMPLETASK'
                     full_clean = self._clean_text(sms['full_text'])[:200]
                     masked = self._mask_number(sms['phone'])
                     cflag = country_flag(sms['country'])
@@ -6090,7 +6122,7 @@ class SMSPanelForwarder:
                         continue
                     mark_otp_seen(uid_key)
 
-                    bot_link = get_setting('bot_link') or 'https://t.me/Urnameismynamebot'
+                    bot_link = get_setting('bot_link') or 'https://t.me/EARNINGWITHSIMPLETASK'
                     full_clean = self._clean_text(sms['full_text'])[:200]
                     masked = self._mask_number(sms['phone'])
                     cflag = country_flag(sms['country'])
@@ -6354,7 +6386,8 @@ if SOCKETIO_AVAILABLE:
                             self.sio.sleep(1)
                         continue
                     self.sio.connect(self.url, headers=self.headers,
-                                     transports=['polling', 'websocket'], wait_timeout=10)
+                                     transports=['polling', 'websocket'], wait_timeout=30)
+                    retry_count = 0  # reset on success
                     while self.sio.connected:
                         self.sio.sleep(1)
                     self.sio.disconnect()
@@ -6362,9 +6395,12 @@ if SOCKETIO_AVAILABLE:
                     if "Already connected" in str(e):
                         time.sleep(1)
                         continue
-                    logger.error(f"Socket.IO error: {e}", exc_info=True)
-                logger.info("Reconnecting in 5s...")
-                time.sleep(5)
+                    logger.error(f"Socket.IO error: {e}")
+                retry_count = getattr(self, '_retry_count', 0) + 1
+                self._retry_count = retry_count
+                backoff = min(30 * (2 ** min(retry_count, 6)), 300)  # exponential up to 5min
+                logger.info(f"Reconnecting in {backoff}s...")
+                time.sleep(backoff)
 
     # IVASMS deduplication now uses seen_otps DB table (see helpers above)
     # No more JSON file needed
@@ -7131,7 +7167,7 @@ def _show_number_display(chat_id, message_id, number, country_key, app_name, ext
         msg_text += f"\n\n📋 <b>All Assigned Numbers:</b>\n" + "\n".join(lines)
 
     markup = types.InlineKeyboardMarkup()
-    markup.add(ibtn("View OTP", url="https://t.me/Urnameismynamebot", style="primary", icon="eye"))
+    markup.add(ibtn("View OTP", url="https://t.me/EARNINGWITHSIMPLETASK", style="primary", icon="eye"))
     markup.row(
         ibtn(cc_btn_text, callback_data=f"toggle_cc|{app_name}|{country_key}|{number}", style="success", icon="earth"),
         ibtn("Change Number", callback_data=f"chg_local|{app_name}|{country_key}", style="danger", icon="refresh"),
@@ -10006,7 +10042,14 @@ def main():
         logger.error(f"Failed to start panel forwarders: {e}")
     logger.info("Forwarders started (IVASMS + Choice SMS + Panels + cleanup)")
     logger.info("Bot polling started.")
-    bot.infinity_polling()
+    try:
+        bot.infinity_polling()
+    except Exception as e:
+        if '409' in str(e) or 'conflict' in str(e).lower():
+            logger.warning("Telegram polling conflict (409) - another instance may be running. Retrying in 30s...")
+            time.sleep(30)
+        else:
+            logger.error(f"Bot polling error: {e}")
 
 if __name__ == "__main__":
     try:
