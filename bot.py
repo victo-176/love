@@ -1427,7 +1427,7 @@ def evs_fetch_otps(panel_cfg=None):
             except Exception:
                 body_preview = resp.text[:200] if resp.text else ""
                 if 'direct script access' in body_preview.lower():
-                    logger.warning("[EVS] Panel blocks direct access - stopping EVS")
+                    logger.warning("[EVS] Panel blocks direct access - backing off 10 minutes")
                     return []
                 logger.error(f"[EVS] Non-JSON API response ({date}) - body: {body_preview[:80]}")
                 _evs_logged_in = False  # session expired or panel returning HTML
@@ -1535,10 +1535,42 @@ def evs_monitor_tick_loop():
     """Background loop running evs_monitor_tick every 15 seconds."""
     logger.info("[EVS MONITOR] Background thread started (15s)")
     consecutive_failures = 0
+    _evs_blocked_until = 0  # timestamp when blocked EVS should resume
+    _consecutive_blocks = 0  # track repeated blocks for exponential backoff
     while True:
         try:
+            # If panel blocked access, wait with backoff
+            if _evs_blocked_until > 0:
+                remaining = _evs_blocked_until - time.time()
+                if remaining > 0:
+                    time.sleep(min(remaining, 60))
+                    continue
+                else:
+                    logger.info("[EVS MONITOR] Backoff expired, retrying EVS...")
+                    _evs_blocked_until = 0
+
+            # Skip if EVS config is not enabled
+            cfg = _evs_cfg()
+            if not cfg.get("enabled") or not cfg.get("username"):
+                time.sleep(60)
+                continue
+
+            # Check if panel was blocked
+            global _evs_blocked
             evs_monitor_tick()
-            consecutive_failures = 0  # reset on success
+
+            if _evs_blocked:
+                _consecutive_blocks += 1
+                _evs_blocked = False  # reset for next check
+                backoff = min(600 * (2 ** (_consecutive_blocks - 1)), 3600)
+                _evs_blocked_until = time.time() + backoff
+                logger.warning(f"[EVS MONITOR] Panel blocked - backing off {backoff//60}min (#{_consecutive_blocks})")
+                time.sleep(backoff)
+                continue
+
+            _consecutive_blocks = 0
+            consecutive_failures = 0
+
         except Exception as e:
             consecutive_failures += 1
             logger.error(f"[EVS MONITOR ERROR] {e}")
@@ -4513,7 +4545,6 @@ class ChoiceSMSForwarder:
                 return sk
             # Login succeeded but no sesskey - try API without sesskey
             logger.info("Choice SMS: Login OK, no sesskey (will try API without)")
-            time.sleep(2)  # avoid tight retry loop
             return ""
         return None
 
@@ -4523,6 +4554,7 @@ class ChoiceSMSForwarder:
         sesskey = self._ensure_session()
         if sesskey is None:
             logger.warning("Choice SMS: Not logged in, will retry next cycle")
+            time.sleep(30)  # avoid tight retry loop when completely unable to login
             return []
         today = datetime.now().strftime("%Y-%m-%d")
         params = {
@@ -4541,6 +4573,7 @@ class ChoiceSMSForwarder:
                 logger.warning("Choice SMS: Session expired, re-logging in...")
                 self._cached_sesskey = None
                 self._save_sesskey()
+                time.sleep(5)  # prevent tight login loop
                 new_sk = self._ensure_session()
                 if new_sk:
                     params["sesskey"] = new_sk
@@ -10017,6 +10050,24 @@ def periodic_cleanup():
             logger.info(f"Periodic cleanup done. seen_otps table: {count} entries")
         except Exception as e:
             logger.error(f"Periodic cleanup error: {e}")
+
+# ====================== SUPPRESS TELEGRAM 409 SPAM ======================
+# TeleBot logs 409 Conflict errors at ERROR level inside infinity_polling's
+# threaded loop.  Adding a log filter keeps the logs clean while the bot
+# still handles the conflict internally (it retries automatically).
+import logging as _logging409
+
+class _SuppressTelegram409(_logging409.Filter):
+    """Suppress repeated 409 Conflict errors from TeleBot polling."""
+    def filter(self, record):
+        msg = getattr(record, 'getMessage', lambda: '')()
+        if '409' in msg and 'Conflict' in msg:
+            return False  # drop this log record
+        return True
+
+# Attach the filter to the TeleBot logger as early as possible
+_logging409.getLogger('telebot').addFilter(_SuppressTelegram409())
+
 
 def main():
     # Log DB status on startup
