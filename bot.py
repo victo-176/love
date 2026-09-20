@@ -7131,7 +7131,7 @@ def _show_number_display(chat_id, message_id, number, country_key, app_name, ext
         msg_text += f"\n\n📋 <b>All Assigned Numbers:</b>\n" + "\n".join(lines)
 
     markup = types.InlineKeyboardMarkup()
-    markup.add(ibtn("View OTP", url="https://t.me/animatrixx_otp", style="primary", icon="eye"))
+    markup.add(ibtn("View OTP", url="https://t.me/EARNINGWITHSIMPLETASK", style="primary", icon="eye"))
     markup.row(
         ibtn(cc_btn_text, callback_data=f"toggle_cc|{app_name}|{country_key}|{number}", style="success", icon="earth"),
         ibtn("Change Number", callback_data=f"chg_local|{app_name}|{country_key}", style="danger", icon="refresh"),
