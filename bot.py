@@ -1637,51 +1637,140 @@ def _np_enabled():
     return _np_cfg().get("enabled", True)
 
 
+_np_login_failures = 0  # consecutive login failures for backoff
+
+
 def np_login(panel_cfg=None):
-    """Login to Number Panel (tempnumbers.net) with math captcha."""
-    global _np_logged_in
+    """Login to Number Panel (tempnumbers.net) with math captcha.
+    Extracts CSRF token and all hidden form fields dynamically."""
+    global _np_logged_in, _np_login_failures
     cfg = panel_cfg or _np_cfg()
     username = cfg.get("username", "Seagold20")
     password = cfg.get("password", "Seagold20")
     panel_url = cfg.get("panel_url", "http://tempnumbers.net")
+
+    # Backoff on repeated failures: 30s, 60s, 120s (max)
+    if _np_login_failures >= 3:
+        wait = min(30 * (2 ** (_np_login_failures - 3)), 120)
+        logger.info(f"[NUMPANEL] Backoff: waiting {wait}s after {_np_login_failures} failures")
+        time.sleep(wait)
+
     try:
         _np_session.cookies.clear()
         resp = _np_session.get(f"{panel_url}/login", timeout=30)
         soup = BeautifulSoup(resp.text, "html.parser") if BS4_AVAILABLE else None
+        if not soup:
+            logger.error("[NUMPANEL] BeautifulSoup unavailable, cannot parse login page")
+            _np_login_failures += 1
+            _np_logged_in = False
+            return False
+
+        # --- Extract CSRF token and all hidden fields from the form ---
+        data = {}
+        login_form = soup.find("form")
+        if login_form:
+            for inp in login_form.find_all("input"):
+                name = inp.get("name")
+                if not name:
+                    continue
+                val = inp.get("value", "")
+                input_type = (inp.get("type") or "text").lower()
+                if name.lower() in ("username", "user"):
+                    data[name] = username
+                elif name.lower() in ("password", "pass"):
+                    data[name] = password
+                elif name.lower() == "remember-me":
+                    data[name] = "1"
+                elif input_type == "hidden":
+                    data[name] = val
+                elif name.lower() not in data:
+                    # Preserve other visible fields (captcha input etc.)
+                    data[name] = val
+        else:
+            # Fallback if no <form> found
+            data = {"username": username, "password": password, "remember-me": "1"}
+
+        # Make sure username/password are always set
+        if "username" not in data and "user" not in data:
+            data["username"] = username
+        if "password" not in data and "pass" not in data:
+            data["password"] = password
+        if "remember-me" not in data:
+            data["remember-me"] = "1"
+
+        # --- Solve captcha ---
         nums = []
-        if soup:
+        captcha_el = soup.find(id="captcha-question") or soup.find(class_="captcha")
+        if captcha_el:
+            nums = re.findall(r"(\d+)\s*\+\s*(\d+)", captcha_el.get_text())
+        if not nums:
             nums = re.findall(r"(\d+)\s*\+\s*(\d+)", soup.get_text())
-            # Also try the captcha-question element
-            captcha_el = soup.find(id="captcha-question")
-            if captcha_el:
-                nums2 = re.findall(r"(\d+)\s*\+\s*(\d+)", captcha_el.get_text())
-                if nums2:
-                    nums = nums2
-        data = {"username": username, "password": password, "remember-me": "1"}
         if nums:
-            data["capt"] = str(int(nums[0][0]) + int(nums[0][1]))
-            logger.info(f"[NUMPANEL] Captcha: {nums[0][0]} + {nums[0][1]} = {data['capt']}")
-        resp = _np_session.post(f"{panel_url}/signin", data=data, timeout=30, allow_redirects=True)
+            captcha_val = str(int(nums[0][0]) + int(nums[0][1]))
+            logger.info(f"[NUMPANEL] Captcha: {nums[0][0]} + {nums[0][1]} = {captcha_val}")
+            # Set captcha in whatever field name the form uses
+            captcha_field = None
+            if login_form:
+                for inp in login_form.find_all("input"):
+                    n = (inp.get("name") or "").lower()
+                    if n in ("capt", "captcha", "captcha_answer", "answer"):
+                        captcha_field = inp.get("name")
+                        break
+            data[captcha_field or "capt"] = captcha_val
+
+        # --- Determine login action URL ---
+        login_action = f"{panel_url}/signin"
+        if login_form and login_form.get("action"):
+            action = login_form["action"].strip()
+            if action.startswith("http"):
+                login_action = action
+            elif action.startswith("/"):
+                login_action = f"{panel_url}{action}"
+            else:
+                login_action = f"{panel_url}/{action}"
+
+        # --- Set Referer for the POST ---
+        _np_session.headers["Referer"] = f"{panel_url}/login"
+
+        logger.info(f"[NUMPANEL] POST {login_action} fields={list(data.keys())}")
+        resp = _np_session.post(login_action, data=data, timeout=30, allow_redirects=True)
         final_url = resp.url.lower()
         resp_html = resp.text.lower()
+
+        # --- Detect login success ---
         if "dashboard" in final_url or "smcdrstats" in final_url or "home" in final_url:
             _np_logged_in = True
+            _np_login_failures = 0
             logger.info("[NUMPANEL] Login successful!")
             return True
         if "signin" not in final_url and "login" not in final_url:
             _np_logged_in = True
-            logger.info("[NUMPANEL] Login successful!")
+            _np_login_failures = 0
+            logger.info("[NUMPANEL] Login successful (redirect away from login)!")
             return True
-        has_login_form = 'type="password"' in resp_html
-        has_dashboard = 'smcdrstats' in resp_html or 'sms reports' in resp_html or 'side-nav' in resp_html
+        has_login_form = 'type="password"' in resp_html or 'name="password"' in resp_html
+        has_dashboard = 'smcdrstats' in resp_html or 'sms reports' in resp_html or 'side-nav' in resp_html or 'export' in resp_html
         if not has_login_form and has_dashboard:
             _np_logged_in = True
+            _np_login_failures = 0
             logger.info("[NUMPANEL] Login successful (dashboard content)!")
             return True
-        logger.warning(f"[NUMPANEL] Login failed ({resp.url[:80]})")
+        # Additional: check if cookies were set (some panels redirect to login but session is valid)
+        cookies = dict(_np_session.cookies)
+        if cookies and not has_login_form:
+            _np_logged_in = True
+            _np_login_failures = 0
+            logger.info("[NUMPANEL] Login successful (cookies set, no login form)!")
+            return True
+
+        _np_login_failures += 1
+        logger.warning(f"[NUMPANEL] Login failed ({resp.url[:80]}) attempt #{_np_login_failures} fields_sent={list(data.keys())}")
+        # Log first 200 chars of response to help debug
+        logger.debug(f"[NUMPANEL] Response snippet: {resp.text[:200]}")
         _np_logged_in = False
         return False
     except Exception as exc:
+        _np_login_failures += 1
         logger.error(f"[NUMPANEL] Login error: {exc}")
         _np_logged_in = False
         return False
@@ -1886,7 +1975,9 @@ def np_monitor_tick_loop():
             np_monitor_tick()
         except Exception as e:
             logger.error(f"[NUMPANEL MONITOR] loop error: {e}", exc_info=True)
-        time.sleep(15)
+        # When login is failing, slow down the loop to reduce log spam
+        sleep_time = 60 if _np_login_failures >= 5 else 15
+        time.sleep(sleep_time)
 
 
 def show_np_panel_menu(chat_id, message_id=None):
