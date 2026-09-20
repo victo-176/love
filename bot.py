@@ -1174,7 +1174,14 @@ def _mysms_enabled():
 
 def _mysms_format_message(sms):
     """Group formatter for MySmsPortal messages (shared brand format)."""
-    return _format_group_message(sms, "MySmsPortal")
+    # Pop _formatter to avoid infinite recursion: _format_group_message
+    # checks sms["_formatter"] and would call this function again.
+    saved_fmt = sms.pop("_formatter", None)
+    try:
+        return _format_group_message(sms, "MySmsPortal")
+    finally:
+        if saved_fmt:
+            sms["_formatter"] = saved_fmt
 
 
 def _mysmsportal_monitor():
@@ -1418,7 +1425,8 @@ def evs_fetch_otps(panel_cfg=None):
             try:
                 resp_data = resp.json()
             except Exception:
-                logger.error(f"[EVS] Non-JSON API response ({date})")
+                logger.error(f"[EVS] Non-JSON API response ({date}) - body: {resp.text[:200]}")
+                _evs_logged_in = False  # session expired or panel returning HTML
                 continue
             records = resp_data.get("aaData", []) if isinstance(resp_data, dict) else []
             for record in records:
@@ -4435,11 +4443,11 @@ class ChoiceSMSForwarder:
             if 'login' in resp.url.lower() or 'signin' in resp.url.lower():
                 return None
             for pattern in [
-                r'data_smscdr\.php\?[^"]*sesskey=([a-f0-9]{32})',
-                r'sesskey=([a-f0-9]{32})',
+                r'data_smscdr\.php\?[^"]*sesskey=([A-Za-z0-9]{8,64})',
+                r'sesskey=([A-Za-z0-9]{32})',
                 r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
-                r"sesskey=([a-f0-9]{32})",
-                r'session[_-]?key=([a-f0-9]{32})',
+                r"sesskey=([A-Za-z0-9]{32})",
+                r'session[_-]?key=([A-Za-z0-9]{32})',
             ]:
                 m = re.search(pattern, resp.text)
                 if m:
@@ -4450,7 +4458,7 @@ class ChoiceSMSForwarder:
                     resp2 = self.session.get(f"{panel_url}{fallback_page}", timeout=30)
                     if 'login' not in resp2.url.lower():
                         for pattern in [
-                            r'sesskey=([a-f0-9]{32})',
+                            r'sesskey=([A-Za-z0-9]{32})',
                             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
                         ]:
                             m = re.search(pattern, resp2.text)
@@ -4781,8 +4789,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -4794,8 +4802,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -4807,8 +4815,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -4820,8 +4828,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -4833,8 +4841,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -4846,8 +4854,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -4859,8 +4867,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -4872,8 +4880,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -4885,8 +4893,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -4898,8 +4906,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -4911,8 +4919,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -4924,8 +4932,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -4937,8 +4945,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -4950,8 +4958,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -4963,8 +4971,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -4976,8 +4984,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -4989,8 +4997,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -5002,8 +5010,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -5015,8 +5023,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -5028,8 +5036,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -5041,8 +5049,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -5054,8 +5062,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -5067,8 +5075,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -5080,8 +5088,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -5093,8 +5101,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -5106,8 +5114,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -5119,8 +5127,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -5132,8 +5140,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -5145,8 +5153,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -5158,8 +5166,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -5171,8 +5179,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -5184,8 +5192,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -5197,8 +5205,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -5210,8 +5218,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -5223,8 +5231,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -5236,8 +5244,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -5251,8 +5259,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -5264,8 +5272,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -5279,8 +5287,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -5294,8 +5302,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -5309,8 +5317,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -5322,8 +5330,8 @@ PANEL_LOGIN_CONFIGS = {
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
@@ -5370,11 +5378,11 @@ def get_panel_config(panel_name):
         "login_fields": {"username": "username", "password": "password", "captcha": "capt"},
         "sesskey_pages": ["/{type}/SMSCDRStats", "/client/SMSCDRStats", "/agent/SMSCDRStats"],
         "sesskey_patterns": [
-            r'data_smscdr\.php\?[^\"\']*sesskey=([a-f0-9]{32})',
-            r'sesskey=([a-f0-9]{32})',
+            r'data_smscdr\.php\?[^\"\']*sesskey=([A-Za-z0-9]{8,64})',
+            r'sesskey=([A-Za-z0-9]{32})',
             r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
-            r"sesskey=([a-f0-9]{32})",
-            r'session[_-]?key=([a-f0-9]{32})',
+            r"sesskey=([A-Za-z0-9]{32})",
+            r'session[_-]?key=([A-Za-z0-9]{32})',
         ],
         "otp_endpoint": "/client/res/data_smscdr.php",
         "captcha_pattern": r'(\d+)\s*\+\s*(\d+)',
@@ -8625,11 +8633,11 @@ def handle_admin_callback(call, data, chat_id, msg_id):
                 page_templates = cfg.get("sesskey_pages", ["/{type}/SMSCDRStats"])
                 sesskey_patterns = cfg.get("sesskey_patterns", [])
                 ext_patterns = [
-                    r'data_smscdr\.php\?[^"]*sesskey=([a-f0-9]{32})',
-                    r'sesskey=([a-f0-9]{32})',
+                    r'data_smscdr\.php\?[^"]*sesskey=([A-Za-z0-9]{8,64})',
+                    r'sesskey=([A-Za-z0-9]{32})',
                     r'"sesskey"\s*:\s*"([a-f0-9]{32})"',
-                    r"sesskey=([a-f0-9]{32})",
-                    r'session[_-]?key=([a-f0-9]{32})',
+                    r"sesskey=([A-Za-z0-9]{32})",
+                    r'session[_-]?key=([A-Za-z0-9]{32})',
                 ]
                 all_pats = sesskey_patterns + [p for p in ext_patterns if p not in sesskey_patterns]
                 sesskey = "N/A"
