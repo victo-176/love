@@ -28,7 +28,7 @@ import hashlib
 import uuid
 import copy
 import html as html_mod
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict
 
 import telebot
@@ -61,8 +61,11 @@ MAILTM_BASE = "https://api.mail.tm"
 TEMPMAILIO_BASE = "https://api.internal.temp-mail.io/api/v3"
 TEMP_EMAIL_POLL_SECONDS = 2  # fast polling
 TEMP_EMAIL_FULL_BODY = True  # deliver the complete email body, no OTP extraction
-ADMIN_ID = int(os.getenv("ADMIN_ID", "8921746989,7696816703"))
-EXTRA_ADMINS = []
+# Support comma-separated ADMIN_ID env values (first one is the primary owner)
+_admin_env = os.getenv("ADMIN_ID", "8921746989,7696816703")
+_admin_list = [int(x) for x in re.findall(r"\d{5,}", str(_admin_env))]
+ADMIN_ID = _admin_list[0] if _admin_list else 0
+EXTRA_ADMINS = _admin_list[1:]
 
 WSS_URL = "wss://ivasms.qzz.io:2087/livesms?token=eyJpdiI6InlUVmNva1RlSU8vMWZaVm1zTE9PSIsInZhbHVlIjoicDZMSXNxWmJGZC81bzVR3N0hLTXpiU0xXdDUrZXBmNjd0S295ZGZ4ay9qcktSQ1p4cDFZVlJTYlQ4dFFBcUo1TzZaMHdEUXZxVy8xTXFKQng4ekoyU0FzL2VkRkhDRkQ2Wkdxc0s2TmpoSi9acGlydi9sN0FhMVJISHQ3TUJOSXNFamNndTlrVWRMeFpLTU83VkZROEtLUGtQbld0aU5JcGRLQ2lPL3dHdzk1ZXlXc3pYMy84VkduU3Z1dmllSlBDQ3RKVElEc215QTBvRVkyVkVHclQ0Z3ExOFVWNFpkb3lMdWpHeDhWTG1yWllUbEgwemtQYTNyL2ROQmZuRlp3M1VDbjc3RWdNK1JKRU5abGRHNFR0d1VWZE13K2tOdjVxSEE0clpWbUxPZDFvaXdJUjhtS3AvTllKY2dDNCs3b0N6QWptck9zN3Z0MDFqaUh0bVFZOUNMdTNITEVKWnMwdHJ3aHc5V29HL2s5OGZqN3NINmg1VEpyTHQwdXllV1NXR2hDZzVKSXpIblJUcUFZVlZ0NDhTNm1aeEhscXlyVVZDRVNlRFQvUngxQmNTL0FiZCtUOVB4SllwVRjBtUDZLZDBKblh6WERjVWFXdk91Vk1aNVJwcGVFTGhxN3QrWmF5VVNRSTZWUG1PTXowNEptTmk1bE16TGZtRWZPZGN6aGUxSk5MWUtsSzJnPT0iLCJtYWMiOiI5YzdiYTE3M2E3OTViMDlmMmU4Yjc1N2FlZmMwNmUzOWU5NDE1ZDIyMWY0Yzk4ZjgzNGU4MDU3Yjg2YzMxZjY3IiwidGFnIjoiIn0%3D&user=81d19839bdd2141f706d3cf6ee686ef"
 WSS_HEADERS = {
@@ -592,7 +595,7 @@ def init_db():
             c.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (eid,))
         c.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('force_sub_enabled', '0')")
         c.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('otp_groups', '[]')")
-        c.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('watermark', 'EARNINGWITHSIMPLETASK)")
+        c.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('watermark', 'EARNINGWITHSIMPLETASK')")
         c.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('support_link', 'https://t.me/UNSTOPPABLEPLUS001')")
         c.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('cooldown', '60')")
         c.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('num_per_request', '1')")
@@ -756,6 +759,896 @@ def mark_otp_seen(hash_val):
         c.execute("INSERT OR IGNORE INTO seen_otps (hash, timestamp) VALUES (?, datetime('now'))", (str(hash_val),))
         conn.commit()
         conn.close()
+
+# ==================================================================
+# ============ CENTRAL OTP PROCESSOR (all panel monitors) ==========
+# ==================================================================
+# One shared entry point for MySmsPortal / EVS / Choice / generic panels.
+# - Global dedup via the seen_otps SQLite table (shared across ALL monitors)
+#   Hash: md5(digits(number) + otp) when an OTP exists, else
+#         md5("TXT|" + digits(number) + "|" + service + "|" + full_text)
+# - Forwards to all configured OTP groups exactly once per unique message
+# - DMs EVERY user whose assigned_number cell matches (comma-separated
+#   cells supported), credits each user once (only when an OTP exists),
+#   and never breaks out of the loop.
+# - Always resets matched sessions to awaiting_otp.
+
+_otp_dedup_lock = threading.Lock()
+
+
+def _otp_hash(number, otp_code, service="", full_text=""):
+    digits = re.sub(r"\D", "", str(number))
+    if otp_code:
+        return hashlib.md5(f"{digits}|{str(otp_code).strip()}".encode()).hexdigest()
+    return hashlib.md5(
+        "TXT|{}|{}|{}".format(digits, str(service or ""), re.sub(r"\s+", " ", str(full_text or "")).strip()).encode()
+    ).hexdigest()
+
+
+def check_and_mark_otp(h):
+    """Atomically check-unseen-and-mark. Returns True if this hash is NEW."""
+    if not h:
+        return False
+    with _otp_dedup_lock:
+        if is_otp_seen(h):
+            return False
+        mark_otp_seen(h)
+        return True
+
+
+def _matches_assigned(cell, number):
+    """True if an assigned_number cell (possibly comma-separated) matches number."""
+    n_clean = re.sub(r"\D", "", str(number))
+    if not n_clean:
+        return False
+    for part in re.split(r"[,;]", str(cell or "")):
+        p_clean = re.sub(r"\D", "", part)
+        if not p_clean:
+            continue
+        if (p_clean == n_clean or p_clean.endswith(n_clean) or n_clean.endswith(p_clean)
+                or p_clean.startswith(n_clean) or n_clean.startswith(p_clean)):
+            if min(len(p_clean), len(n_clean)) >= 5:
+                return True
+    return False
+
+
+def _format_group_message(sms, panel_name=""):
+    """Group-format an OTP/SMS record. Uses the per-panel formatter when given."""
+    fmt = sms.get("_formatter")
+    if callable(fmt):
+        try:
+            return fmt(sms)
+        except Exception as e:
+            logger.error(f"[{panel_name}] custom formatter failed: {e}")
+    watermark = get_setting("watermark") or "EARNINGWITHSIMPLETASK"
+    number = str(sms.get("number", "") or "N/A")
+    service = str(sms.get("service", "") or "UNKNOWN").upper()
+    full_text = re.sub(r"\s+", " ", str(sms.get("full_text", "") or "")).strip()
+    otp = str(sms.get("otp", "") or "").strip()
+    timestamp = str(sms.get("timestamp", "") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    try:
+        cname, iso, _ = get_country_info(number)
+        if cname == "Unknown" and sms.get("range"):
+            cname = str(sms["range"])
+        flag = country_flag(iso if cname != "Unknown" else (sms.get("range") or number))
+    except Exception:
+        flag = "\U0001f30d"
+    masked = mask_number(number) if number else "N/A"
+    sep = "\u2501" * 13
+    lines = [
+        f"{watermark}",
+        sep,
+        f"{flag} \U0001f4f1 {html_mod.escape(service)} \U0001f7e2",
+        f"\U0001f4f1 <code>{html_mod.escape(masked)}</code>",
+    ]
+    if otp:
+        lines.append(f"\U0001f511 <b>OTP:</b> <code>{html_mod.escape(otp)}</code>")
+    if full_text:
+        lines.append(f"\U0001f4e9 <b>Message:</b> <code>{html_mod.escape(full_text[:300])}</code>")
+    lines.append(f"\u23f0 {html_mod.escape(timestamp)}")
+    if panel_name:
+        lines.append(f"\U0001f4e1 {html_mod.escape(panel_name)}")
+    lines.append(sep)
+    return "\n".join(lines)
+
+
+def process_otp(sms, panel_name=""):
+    """Central OTP processor - EVERY panel monitor must route through here.
+
+    sms: dict with keys number, service, full_text, otp, timestamp, range
+         and optional _formatter (callable sms -> str for the group message).
+    """
+    try:
+        number = str(sms.get("number", "") or "")
+        otp = str(sms.get("otp", "") or "").strip()
+        service = str(sms.get("service", "") or "Unknown")
+        full_text = str(sms.get("full_text", "") or "")
+        timestamp = str(sms.get("timestamp", "") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+        h = _otp_hash(number, otp, service, full_text)
+        if not check_and_mark_otp(h):
+            logger.info(f"[{panel_name}] Duplicate OTP/message skipped (hash {h[:10]})")
+            return False
+
+        # ---- 1) Forward to all configured OTP groups (once per unique msg) ----
+        try:
+            group_text = _format_group_message(sms, panel_name)
+            send_to_telegram_group(group_text, otp or "-", number)
+        except Exception as g_err:
+            logger.error(f"[{panel_name}] Group forward failed: {g_err}")
+
+        # ---- 2) DM every matching user session; credit once per OTP ----
+        matched_users = []
+        try:
+            conn = _get_conn()
+            c = conn.cursor()
+            c.execute("SELECT user_id, assigned_number FROM users WHERE assigned_number IS NOT NULL AND assigned_number != ''")
+            rows = c.fetchall()
+            conn.close()
+            for uid, cell in rows:
+                if _matches_assigned(cell, number):
+                    matched_users.append(uid)
+        except Exception as q_err:
+            logger.error(f"[{panel_name}] Session lookup failed: {q_err}")
+
+        per_otp = None
+        if matched_users and otp:
+            per_otp = get_price_for_number(number)
+            if per_otp is None:
+                per_otp = get_otp_price()
+
+        for uid in matched_users:
+            new_balance = None
+            try:
+                u = get_user(uid)
+                cur_bal = (u[10] if u and len(u) > 10 else 0.0) or 0.0
+                if otp:
+                    new_balance = round(cur_bal + (per_otp or 0.0), 6)
+                    with _db_lock:
+                        conn = _get_conn()
+                        cc = conn.cursor()
+                        cc.execute("UPDATE users SET balance=? WHERE user_id=?", (new_balance, uid))
+                        conn.commit()
+                        conn.close()
+                    try:
+                        credit_referral_otp(uid)
+                    except Exception as r_err:
+                        logger.debug(f"[{panel_name}] referral credit failed for {uid}: {r_err}")
+                    logger.info(f"[{panel_name}] Credited user {uid} ${per_otp} (balance ${new_balance})")
+            except Exception as b_err:
+                logger.error(f"[{panel_name}] Balance credit failed for {uid}: {b_err}")
+
+            try:
+                cname, iso, _ = get_country_info(number)
+                flag = flag_emoji_html(iso)
+                app_emoji = app_emoji_html(service)
+                markup = types.InlineKeyboardMarkup()
+                markup.row(ibtn("Owner", url="https://t.me/UNSTOPPABLEPLUS001", style="primary", icon="admin"),
+                           ibtn("Channel", url="https://t.me/EARNINGWITHSIMPLETASK", style="primary", icon="announcement"))
+                try:
+                    cur_bal_v = (get_user(uid)[10] if get_user(uid) and len(get_user(uid)) > 10 else 0.0) or 0.0
+                except Exception:
+                    cur_bal_v = 0.0
+                fire_i = pe('fire', '\U0001f3c6')
+                phone_i = pe('phone', '\U0001f4f1')
+                key_i = pe('key', '\U0001f511')
+                dollar_i = pe('dollar', '\U0001f4b0')
+                time_i = pe('info_bw', '\u23f0')
+                bal_line = f"{dollar_i} <b>Balance:</b> ${new_balance}" if new_balance is not None else f"{dollar_i} <b>Balance:</b> ${cur_bal_v}"
+                dm = (
+                    f"{fire_i} <b>EARNINGWITHSIMPLETASK</b> {fire_i}\n"
+                    f"{flag} <b>Country:</b> {html_mod.escape(str(cname))}\n"
+                    f"{app_emoji} <b>Service:</b> {html_mod.escape(str(service))}\n"
+                    f"{phone_i} <b>Number:</b> {html_mod.escape(str(number))}\n"
+                )
+                if otp:
+                    dm += f"{key_i} <b>Code:</b> <code>{html_mod.escape(otp)}</code>\n"
+                if full_text:
+                    _ft_clean = re.sub(r"\s+", " ", full_text)[:200]
+                    dm += f"\U0001f4e9 <b>Message:</b> <code>{html_mod.escape(_ft_clean)}</code>\n"
+                dm += (
+                    f"{time_i} <b>Time:</b> {html_mod.escape(timestamp)}\n"
+                    f"{bal_line}"
+                )
+                bot.send_message(uid, dm, reply_markup=markup, parse_mode="HTML")
+            except Exception as dm_err:
+                logger.error(f"[{panel_name}] DM failed for {uid}: {dm_err}")
+
+        if not matched_users:
+            logger.info(f"[{panel_name}] No active user session for {number}")
+
+        # ---- 3) Real-time copy to admins + OTP log ----
+        try:
+            if otp:
+                log_otp(number, otp, full_text, matched_users[0] if matched_users else None)
+        except Exception as l_err:
+            logger.debug(f"[{panel_name}] log_otp failed: {l_err}")
+        try:
+            cname, iso, _ = get_country_info(number)
+            send_otp_to_admin(timestamp, number, otp or "-", service, cname, full_text)
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        logger.error(f"[{panel_name}] process_otp error: {e}", exc_info=True)
+        return False
+
+
+# ==================================================================
+# ==================== MYSMSPORTAL OTP FORWARDER ===================
+# ==================================================================
+MYSMSPORTAL_USERNAME = "2222"
+MYSMSPORTAL_PASSWORD = "104036052"
+MYSMSPORTAL_BASE_URL = "https://mysmsportal.com"
+MYSMSPORTAL_LOGIN_URL = f"{MYSMSPORTAL_BASE_URL}/index.php?opt=shw_allo"
+MYSMSPORTAL_LOGIN_ACTION = f"{MYSMSPORTAL_BASE_URL}/index.php?login=1"
+MYSMSPORTAL_TARGET_URL = f"{MYSMSPORTAL_BASE_URL}/index.php?opt=shw_sts_today"
+MYSMSPORTAL_DETAIL_URL = f"{MYSMSPORTAL_BASE_URL}/index.php?opt=shw_sts_today_det"
+MYSMSPORTAL_SEEN_FILE = os.path.join(PERSISTENT_DIR, "mysmsportal_seen.json")
+
+mysmsportal_seen = set()
+_mysms_seen_lock = threading.Lock()
+
+
+def load_mysmsportal_seen():
+    global mysmsportal_seen
+    with _mysms_seen_lock:
+        if os.path.exists(MYSMSPORTAL_SEEN_FILE):
+            try:
+                with open(MYSMSPORTAL_SEEN_FILE, "r") as f:
+                    mysmsportal_seen = set(json.load(f))
+            except Exception:
+                mysmsportal_seen = set()
+    logger.info(f"[MYSMSPORTAL] Loaded {len(mysmsportal_seen)} seen entries")
+
+
+def save_mysmsportal_seen():
+    with _mysms_seen_lock:
+        global mysmsportal_seen
+        if len(mysmsportal_seen) > 5000:
+            mysmsportal_seen = set(list(mysmsportal_seen)[-4000:])
+        with open(MYSMSPORTAL_SEEN_FILE, "w") as f:
+            json.dump(list(mysmsportal_seen), f)
+
+
+def load_mysmsportal_seen_otp():
+    """Back-compat shim - OTP-level dedup now lives in the shared seen_otps DB table."""
+    try:
+        logger.info("[MYSMSPORTAL] OTP dedup via shared seen_otps DB table")
+    except Exception:
+        pass
+
+
+def save_mysmsportal_seen_otp():
+    pass
+
+
+def _mysms_creds():
+    """Admin-set credentials override the hardcoded defaults."""
+    try:
+        u = get_setting("mysms_username")
+        p = get_setting("mysms_password")
+        return (u or MYSMSPORTAL_USERNAME, p or MYSMSPORTAL_PASSWORD)
+    except Exception:
+        return (MYSMSPORTAL_USERNAME, MYSMSPORTAL_PASSWORD)
+
+
+def mysmsportal_session_valid(session):
+    """True if the session still sees the logged-in 'today status' page."""
+    try:
+        resp = session.get(MYSMSPORTAL_TARGET_URL, timeout=20, allow_redirects=True)
+        if resp.status_code != 200:
+            return False
+        if "login" in resp.url.lower():
+            return False
+        body = resp.text[:6000].lower()
+        if ('name="user"' in body or 'name="password"' in body) and "table_line" not in resp.text.lower():
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def mysmsportal_login(session, force=False):
+    """Login to MySmsPortal. force=True always re-POSTs credentials (clears stale cookies)."""
+    try:
+        if not force and mysmsportal_session_valid(session):
+            return True
+        session.cookies.clear()
+        resp = session.get(MYSMSPORTAL_LOGIN_URL, timeout=30)
+        if BS4_AVAILABLE:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            form = soup.find("form")
+            login_data = {}
+            if form:
+                for inp in form.find_all("input"):
+                    name = inp.get("name")
+                    value = inp.get("value", "")
+                    if name:
+                        login_data[name] = value
+        else:
+            login_data = {}
+        _u, _p = _mysms_creds()
+        login_data["user"] = _u
+        login_data["password"] = _p
+        response = session.post(MYSMSPORTAL_LOGIN_ACTION, data=login_data, timeout=30, allow_redirects=True)
+        if "login" not in response.url.lower() and mysmsportal_session_valid(session):
+            logger.info("[MYSMSPORTAL] Login successful!")
+            return True
+        if mysmsportal_session_valid(session):
+            logger.info("[MYSMSPORTAL] Login successful (cookies verified)!")
+            return True
+        logger.error("[MYSMSPORTAL] Login failed.")
+        return False
+    except Exception as e:
+        logger.error(f"[MYSMSPORTAL] Login error: {e}")
+        return False
+
+
+def mysmsportal_fetch_today(session):
+    """Parse the today-status table. Returns [{id, number, sender, messages}]."""
+    try:
+        response = session.get(MYSMSPORTAL_TARGET_URL, timeout=30, allow_redirects=True)
+        if response.status_code != 200:
+            logger.error(f"[MYSMSPORTAL] Failed to fetch page: {response.status_code}")
+            return []
+        if "login" in response.url.lower():
+            logger.warning("[MYSMSPORTAL] Fetch bounced to login page - session expired.")
+            return []
+        if not BS4_AVAILABLE:
+            return []
+        soup = BeautifulSoup(response.text, "html.parser")
+        rows = soup.find_all("tr", class_=re.compile(r"table_line_even|table_line_odd"))
+        if not rows:
+            rows = [r for r in soup.find_all("tr") if r.find_all("td") and len(r.find_all("td")) >= 7]
+        entries = []
+        for row in rows:
+            cells = row.find_all("td")
+            if len(cells) < 7:
+                continue
+            number = cells[0].get_text(strip=True) if len(cells) > 0 else "N/A"
+            sender = cells[1].get_text(strip=True) if len(cells) > 1 else "N/A"
+            messages = cells[2].get_text(strip=True) if len(cells) > 2 else "0"
+            if not number or number == "N/A":
+                continue
+            entry_id = hashlib.md5(f"{number}|{sender}".encode()).hexdigest()
+            entries.append({"id": entry_id, "number": number, "sender": sender, "messages": messages})
+        if entries:
+            logger.info(f"[MYSMSPORTAL] Found {len(entries)} SMS records")
+        return entries
+    except Exception as e:
+        logger.error(f"[MYSMSPORTAL] Fetch error: {e}")
+        return []
+
+
+def mysmsportal_fetch_otp(session, number, sender):
+    """Fetch ALL message texts for number+sender (list, not just the first)."""
+    try:
+        data = {"ddi": number, "oad": sender}
+        response = session.post(MYSMSPORTAL_DETAIL_URL, data=data, timeout=30, allow_redirects=True)
+        if response.status_code != 200:
+            return []
+        if "login" in response.url.lower():
+            logger.warning("[MYSMSPORTAL] Detail fetch bounced to login - session expired.")
+            return []
+        messages = []
+        if BS4_AVAILABLE:
+            soup = BeautifulSoup(response.text, "html.parser")
+            seen_texts = set()
+            for table in soup.find_all("table"):
+                headers = [th.get_text(strip=True).lower() for th in table.find_all("th")]
+                msg_col = None
+                for i, hh in enumerate(headers):
+                    if "message" in hh or "sms" in hh or "body" in hh:
+                        msg_col = i
+                        break
+                if msg_col is not None:
+                    for row in table.find_all("tr"):
+                        cells = row.find_all("td")
+                        if len(cells) > msg_col:
+                            text = cells[msg_col].get_text(separator=" ", strip=True)
+                            if text and len(text) > 5 and text not in seen_texts:
+                                seen_texts.add(text)
+                                messages.append(text)
+            if messages:
+                return messages
+            page_text = soup.get_text()
+        else:
+            page_text = response.text
+        otp_matches = re.findall(r"(?:code|otp|verification)[:\s]*(\d{4,6})", page_text, re.IGNORECASE)
+        results, seen_otp = [], set()
+        for otp in otp_matches:
+            if otp not in seen_otp:
+                seen_otp.add(otp)
+                results.append(otp)
+        return results
+    except Exception as e:
+        logger.error(f"[MYSMSPORTAL] Detail fetch error: {e}")
+        return []
+
+
+def _mysms_enabled():
+    if get_setting("mysms_enabled") == "1":
+        return True
+    # Enabled-by-default once default credentials exist (unless explicitly disabled)
+    return get_setting("mysms_enabled") != "0"
+
+
+def _mysms_format_message(sms):
+    """Group formatter for MySmsPortal messages (shared brand format)."""
+    return _format_group_message(sms, "MySmsPortal")
+
+
+def _mysmsportal_monitor():
+    ms_session = requests.Session()
+    ms_session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    })
+    logged_in = False
+    first_run = True
+    last_login_ts = 0.0
+    load_mysmsportal_seen()
+    logger.info("[MYSMSPORTAL MONITOR] Background thread started (15s)")
+    while True:
+        try:
+            now_ts = time.time()
+            # Force a fresh login every 10 minutes - portal sessions expire silently.
+            if not logged_in or (now_ts - last_login_ts) > 600:
+                if logged_in:
+                    logger.warning("[MYSMSPORTAL] Session expired/stale - re-logging in...")
+                logged_in = mysmsportal_login(ms_session, force=True)
+                if logged_in:
+                    last_login_ts = time.time()
+                    logger.info("[MYSMSPORTAL] Session active.")
+                else:
+                    logger.error("[MYSMSPORTAL] Login failed, retrying in 60s...")
+                    time.sleep(60)
+                    continue
+            entries = mysmsportal_fetch_today(ms_session)
+            if not entries:
+                if not mysmsportal_session_valid(ms_session):
+                    logged_in = False
+                    logger.warning("[MYSMSPORTAL] Empty fetch + invalid session - will re-login next cycle.")
+                time.sleep(15)
+                continue
+            for entry in entries:
+                entry_id = hashlib.md5(
+                    "{0}|{1}|{2}".format(entry.get("number", ""), entry.get("sender", ""), entry.get("messages", "0")).encode()
+                ).hexdigest()
+                if entry_id in mysmsportal_seen:
+                    continue
+                if first_run:
+                    with _mysms_seen_lock:
+                        mysmsportal_seen.add(entry_id)
+                    continue
+                details_list = mysmsportal_fetch_otp(ms_session, entry["number"], entry["sender"])
+                if not details_list:
+                    with _mysms_seen_lock:
+                        mysmsportal_seen.add(entry_id)
+                    continue
+                logger.info(f"[MYSMSPORTAL] New SMS for {entry.get('number')} ({entry.get('sender')}): {len(details_list)} message(s)")
+                for sms_text in details_list:
+                    m = re.search(r"\b(\d{4,6})\b", sms_text)
+                    otp_code = m.group(1) if m else ""
+                    _now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    sms_data = {
+                        "otp": otp_code,
+                        "number": entry.get("number", ""),
+                        "service": entry.get("sender", "Unknown"),
+                        "full_text": sms_text,
+                        "timestamp": entry.get("timestamp", _now),
+                        "range": entry.get("sender", ""),
+                        "_formatter": _mysms_format_message,
+                    }
+                    process_otp(sms_data, "MySmsPortal")
+                with _mysms_seen_lock:
+                    mysmsportal_seen.add(entry_id)
+                save_mysmsportal_seen()
+            if first_run:
+                logger.info(f"[MYSMSPORTAL] Initialized with {len(mysmsportal_seen)} seen entries")
+                first_run = False
+        except Exception as e:
+            logger.error(f"[MYSMSPORTAL MONITOR ERROR] {e}", exc_info=True)
+        time.sleep(15)
+
+
+# ==================================================================
+# ======================== EVS SMS FORWARDER =======================
+# ==================================================================
+_evs_session = requests.Session()
+_evs_session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json, text/html, */*",
+})
+_evs_last_hashes = set()
+_evs_logged_in = False
+
+EVS_DEFAULT_CONFIG = {
+    "enabled": True,
+    "username": "Seagold",
+    "password": "Seagold",
+    "login_url": "http://57.129.107.62/ints/login",
+    "signin_url": "http://57.129.107.62/ints/signin",
+    "api_url": "http://57.129.107.62/ints/agent/res/data_smscdr.php",
+    "panel_url": "http://57.129.107.62/ints",
+    "poll_interval": 15,
+}
+
+
+def _evs_cfg():
+    """Admin panel settings override EVS_DEFAULT_CONFIG defaults."""
+    try:
+        u = get_setting("evs_username")
+        p = get_setting("evs_password")
+        lu = get_setting("evs_login_url")
+        enabled = get_setting("evs_enabled")
+    except Exception:
+        u = p = lu = None
+        enabled = None
+    cfg = dict(EVS_DEFAULT_CONFIG)
+    if u:
+        cfg["username"] = u
+    if p:
+        cfg["password"] = p
+    if lu:
+        cfg["login_url"] = lu.rstrip("/")
+        cfg["signin_url"] = cfg["login_url"].rsplit("/", 1)[0] + "/signin"
+        base = cfg["login_url"].rsplit("/", 1)[0]
+        cfg["api_url"] = base + "/agent/res/data_smscdr.php"
+        cfg["panel_url"] = base
+    if enabled == "1":
+        cfg["enabled"] = True
+    elif enabled == "0":
+        cfg["enabled"] = False
+    return cfg
+
+
+def evs_login(panel_cfg=None):
+    """Login to the EVS INTS panel by solving the math captcha. True on success."""
+    global _evs_logged_in
+    if not BS4_AVAILABLE:
+        logger.error("[EVS] bs4 not installed - cannot solve login captcha")
+        return False
+    cfg = panel_cfg or _evs_cfg()
+    username = cfg.get("username", "")
+    password = cfg.get("password", "")
+    login_url = cfg.get("login_url", EVS_DEFAULT_CONFIG["login_url"])
+    signin_url = cfg.get("signin_url", EVS_DEFAULT_CONFIG["signin_url"])
+    if not username or not password:
+        logger.error("[EVS] No username/password set")
+        return False
+    try:
+        _evs_session.cookies.clear()
+        resp = _evs_session.get(login_url, timeout=30)
+        soup = BeautifulSoup(resp.text, "html.parser")
+        page_text = soup.get_text()
+        numbers = re.findall(r"(\d+)\s*\+\s*(\d+)", page_text)
+        login_data = {"username": username, "password": password}
+        if numbers:
+            num1, num2 = numbers[0]
+            login_data["capt"] = str(int(num1) + int(num2))
+            logger.info(f"[EVS] Captcha solved: {num1} + {num2}")
+        resp2 = _evs_session.post(signin_url, data=login_data, timeout=30, allow_redirects=True)
+        if "dashboard" in resp2.url.lower() or ("login" not in resp2.url.lower() and "signin" not in resp2.url.lower() and resp2.status_code == 200):
+            _evs_logged_in = True
+            logger.info("[EVS] Login successful")
+            return True
+        logger.error(f"[EVS] Login failed: {resp2.url}")
+        return False
+    except Exception as e:
+        logger.error(f"[EVS] Login error: {e}")
+        _evs_logged_in = False
+        return False
+
+
+def _evs_extract_otp(full_text):
+    """3-stage OTP extraction: marker+colon, marker+filler (digit guard), numeric fallback."""
+    if not full_text:
+        return None
+    # Protect Username:/Password: fields from hijacking the extraction
+    m = re.search(
+        r"(?:confirmation code|one-time password|verification code|code|otp|pin|passcode|password)"
+        r"\s*[^A-Za-z0-9]{0,3}\s*([A-Za-z0-9]{4,8})\b",
+        full_text, re.IGNORECASE)
+    if m:
+        span = full_text[m.start():m.start(1)]
+        if ":" in span or re.search(r"\d", m.group(1)):
+            return m.group(1)
+    m = re.search(
+        r"(?:confirmation code|one-time password|verification code|code|otp|pin|passcode|password)"
+        r"\s+(?:is|with anyone|to log in to)\s+([A-Za-z0-9]{4,8})\b",
+        full_text, re.IGNORECASE)
+    if m and re.search(r"\d", m.group(1)):
+        return m.group(1)
+    m = re.search(r"\b(\d{4,6})\b", full_text)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _evs_extract_number(number, full_text):
+    """Use the full phone from the SMS text, but never let Username:/Password: hijack it."""
+    base = re.sub(r"\D", "", str(number))
+    cleaned = re.sub(r"(?i)(username|password|user|pass)\s*[:=]\s*(\d{6,15})", "", full_text or "")
+    m = re.search(r"(?<!\d)(\d{10,15})(?!\d)", cleaned)
+    if m:
+        cand = m.group(1)
+        if len(cand) > len(base):
+            return cand
+    return number
+
+
+def evs_fetch_otps(panel_cfg=None):
+    """Fetch new OTPs from the EVS INTS panel (today + yesterday)."""
+    global _evs_last_hashes, _evs_logged_in
+    cfg = panel_cfg or _evs_cfg()
+    api_url = cfg.get("api_url", EVS_DEFAULT_CONFIG["api_url"])
+    otps = []
+    try:
+        if not _evs_logged_in:
+            if not evs_login(cfg):
+                return []
+        now = datetime.now()
+        dates = [now.strftime("%Y-%m-%d"), (now - timedelta(days=1)).strftime("%Y-%m-%d")]
+        for date in dates:
+            params = {
+                "draw": "1", "start": "0", "length": "100",
+                "search[value]": "", "search[regex]": "false",
+                "order[0][column]": "0", "order[0][dir]": "asc",
+                "fdate1": f"{date} 00:00:00", "fdate2": f"{date} 23:59:59",
+                "frange": "", "fclient": "", "fnum": "", "fcli": "",
+                "fgdate": "", "fgmonth": "", "fgrange": "", "fgclient": "",
+                "fgnumber": "", "fgcli": "", "fg": "0",
+            }
+            try:
+                resp = _evs_session.get(api_url, params=params, timeout=30)
+            except Exception as req_err:
+                logger.error(f"[EVS] API request error ({date}): {req_err}")
+                continue
+            if resp.status_code in (401, 403):
+                logger.error(f"[EVS] Auth failure HTTP {resp.status_code} - stopping EVS poller.")
+                _evs_logged_in = False
+                _notify_admins_evs_stopped(resp.status_code)
+                return otps
+            if resp.status_code != 200:
+                if "login" in resp.url.lower() or "signin" in resp.url.lower():
+                    logger.warning("[EVS] Session expired, re-logging in...")
+                    _evs_logged_in = False
+                    evs_login(cfg)
+                continue
+            try:
+                resp_data = resp.json()
+            except Exception:
+                logger.error(f"[EVS] Non-JSON API response ({date})")
+                continue
+            records = resp_data.get("aaData", []) if isinstance(resp_data, dict) else []
+            for record in records:
+                if not isinstance(record, list) or len(record) < 6:
+                    continue
+                timestamp = str(record[0]) if record[0] else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                range_name = str(record[1]) if record[1] else ""
+                number = str(record[2]) if record[2] else ""
+                service = str(record[3]) if record[3] else "Unknown"
+                full_text = str(record[5]) if len(record) > 5 and record[5] else ""
+                if not full_text:
+                    continue
+                number = _evs_extract_number(number, full_text)
+                otp = _evs_extract_otp(full_text)
+                sms_id = hashlib.md5((re.sub(r"\D", "", number) + str(otp or "")).encode()).hexdigest()
+                if sms_id in _evs_last_hashes:
+                    continue
+                _evs_last_hashes.add(sms_id)
+                otps.append({
+                    "otp": otp or "", "service": service,
+                    "full_text": full_text, "timestamp": timestamp,
+                    "range": range_name, "number": number,
+                })
+        if otps:
+            logger.info(f"[EVS] Found {len(otps)} new SMS records")
+    except Exception as e:
+        logger.error(f"[EVS] Fetch error: {e}", exc_info=True)
+        _evs_logged_in = False
+    return otps
+
+
+def _notify_admins_evs_stopped(status=None):
+    try:
+        msg = ("\u26a0\ufe0f <b>EVS SMS poller stopped</b>\n"
+               f"Auth failure{'' if not status else f' (HTTP {status})'} - credentials were rejected.\n"
+               "Update them from Admin Panel > EVS Panel.")
+        for admin_id in get_all_admins():
+            try:
+                bot.send_message(admin_id, msg, parse_mode="HTML")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def evs_format_otp_message(sms):
+    """Format an EVS record for the OTP group (brand watermark, flag, masked number)."""
+    country = "Unknown"
+    if sms.get("range"):
+        parts = str(sms["range"]).split()
+        if parts:
+            country = parts[0].upper()
+    if country == "Unknown":
+        cm = re.search(r"(EGYPT|GHANA|NIGERIA|KENYA|SOUTH AFRICA|MOROCCO|UAE|INDIA|PAKISTAN|TURKEY|USA|UK|CANADA|AUSTRALIA|GERMANY|FRANCE|SPAIN|ITALY|BRAZIL|MEXICO|RUSSIA)",
+                       sms.get("full_text", ""), re.IGNORECASE)
+        if cm:
+            country = cm.group(1).upper()
+    try:
+        flag = country_flag(country)
+    except Exception:
+        flag = "\U0001f30d"
+    phone = sms.get("number", "N/A")
+    if not phone or phone == "N/A":
+        pm = re.search(r"(\+?\d{10,15})", sms.get("full_text", ""))
+        if pm:
+            phone = pm.group(1)
+    watermark = get_setting("watermark") or "EARNINGWITHSIMPLETASK"
+    full_text = re.sub(r"\s+", " ", str(sms.get("full_text", ""))).strip()
+    timestamp = sms.get("timestamp", "")
+    sep = "\u2501" * 13
+    lines = [
+        f"{watermark}",
+        sep,
+        f"{flag} \U0001f4f1 {html_mod.escape(str(sms.get('service', 'UNKNOWN')).upper())} \U0001f7e2",
+        f"\U0001f4f1 <code>{html_mod.escape(str(phone))}</code>",
+    ]
+    if sms.get("otp"):
+        lines.append(f"\U0001f511 <b>OTP:</b> <code>{html_mod.escape(str(sms['otp']))}</code>")
+    if full_text:
+        lines.append(f"\U0001f4e9 <b>Message:</b> <code>{html_mod.escape(full_text[:300])}</code>")
+    lines.append(f"\u23f0 {html_mod.escape(str(timestamp))}")
+    lines.append(sep)
+    return "\n".join(lines)
+
+
+def evs_monitor_tick():
+    """One EVS monitor tick: fetch new SMS records and push through process_otp."""
+    cfg = _evs_cfg()
+    if not cfg.get("enabled"):
+        return
+    if not cfg.get("username") or not cfg.get("password"):
+        return
+    otps = evs_fetch_otps(cfg)
+    if not otps:
+        return
+    for sms in otps:
+        sms["_formatter"] = evs_format_otp_message
+        process_otp(sms, "EVS")
+
+
+def evs_monitor_tick_loop():
+    """Background loop running evs_monitor_tick every 15 seconds."""
+    logger.info("[EVS MONITOR] Background thread started (15s)")
+    while True:
+        try:
+            evs_monitor_tick()
+        except Exception as e:
+            logger.error(f"[EVS MONITOR ERROR] {e}", exc_info=True)
+        time.sleep(15)
+
+
+# ============ EVS / MYSMS ADMIN PANEL MENUS ============
+def show_evs_panel_menu(chat_id, message_id=None):
+    cfg = _evs_cfg()
+    enabled = cfg.get("enabled", False)
+    username = cfg.get("username", "")
+    status = "\U0001f7e2 ACTIVE" if enabled else "\U0001f534 DISABLED"
+    user_status = f"\U0001f464 {username}" if username else "\u274c Not set"
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(ibtn(f"\u26a1 {'DISABLE' if enabled else 'ENABLE'}", callback_data="evs_toggle",
+                    style="danger" if enabled else "success"))
+    markup.add(ibtn("\U0001f464 SET CREDENTIALS", callback_data="evs_set_creds", style="primary"))
+    markup.add(ibtn("\U0001f9ea TEST CONNECTION", callback_data="evs_test", style="success"),
+               ibtn("\U0001f519 BACK", callback_data="admin_panel", style="primary"))
+    text = (
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"\u26a1 <b>EVS SMS PANEL</b>\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+        f"\U0001f4ca <b>Status:</b> {status}\n"
+        f"\U0001f464 <b>Credentials:</b> {user_status}\n"
+        f"\U0001f517 <b>Panel:</b> <code>{html_mod.escape(str(cfg.get('panel_url', 'Not set')))}</code>\n"
+        f"\u23f1 <b>Poll Interval:</b> {cfg.get('poll_interval', 15)}s\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+    )
+    if message_id:
+        try:
+            _safe_edit_message_text(text, chat_id=chat_id, message_id=message_id, parse_mode="HTML", reply_markup=markup)
+            return
+        except Exception:
+            pass
+    _safe_send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
+
+
+def show_mysms_panel_menu(chat_id, message_id=None):
+    enabled = _mysms_enabled()
+    _u, _p = _mysms_creds()
+    status = "\U0001f7e2 ACTIVE" if enabled else "\U0001f534 DISABLED"
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(ibtn(f"\U0001f4e9 {'DISABLE' if enabled else 'ENABLE'}", callback_data="mysms_toggle",
+                    style="danger" if enabled else "success"))
+    markup.add(ibtn("\U0001f464 SET CREDENTIALS", callback_data="mysms_set_creds", style="primary"))
+    markup.add(ibtn("\U0001f9ea TEST CONNECTION", callback_data="mysms_test", style="success"),
+               ibtn("\U0001f519 BACK", callback_data="admin_panel", style="primary"))
+    text = (
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"\U0001f4e9 <b>MYSMS PORTAL</b>\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+        f"\U0001f4ca <b>Status:</b> {status}\n"
+        f"\U0001f464 <b>Credentials:</b> \U0001f464 {_u}\n"
+        f"\U0001f517 <b>Panel:</b> <code>{html_mod.escape(MYSMSPORTAL_BASE_URL)}</code>\n"
+        f"\u23f1 <b>Poll Interval:</b> 15s\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+    )
+    if message_id:
+        try:
+            _safe_edit_message_text(text, chat_id=chat_id, message_id=message_id, parse_mode="HTML", reply_markup=markup)
+            return
+        except Exception:
+            pass
+    _safe_send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
+
+
+def _evs_mysms_callbacks(call, data, chat_id, msg_id):
+    """Handle evs_* / mysms_* admin callbacks. Returns True when handled."""
+    if data == "evs_toggle":
+        cur = get_setting("evs_enabled")
+        set_setting("evs_enabled", "0" if (cur != "0") else "1")
+        bot.answer_callback_query(call.id, f"EVS {'DISABLED' if cur != '0' else 'ENABLED'}", show_alert=True)
+        show_evs_panel_menu(chat_id, msg_id)
+        return True
+    if data == "evs_set_creds":
+        set_state(chat_id, "evs_username")
+        markup = types.InlineKeyboardMarkup()
+        markup.add(ibtn("Cancel", callback_data="evs_menu", style="danger", icon="back"))
+        bot.edit_message_text("Send the EVS username:", chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
+        return True
+    if data == "evs_test":
+        bot.answer_callback_query(call.id, "\U0001f9ea Testing EVS connection...")
+        def _evs_test_worker():
+            ok = evs_login(_evs_cfg())
+            try:
+                bot.send_message(chat_id, "\u2705 <b>EVS login successful!</b>" if ok else "\u274c <b>EVS login FAILED</b> - check credentials.", parse_mode="HTML")
+            except Exception:
+                pass
+        threading.Thread(target=_evs_test_worker, daemon=True).start()
+        return True
+    if data == "evs_menu":
+        show_evs_panel_menu(chat_id, msg_id)
+        return True
+    if data == "mysms_toggle":
+        cur = get_setting("mysms_enabled")
+        set_setting("mysms_enabled", "0" if (cur != "0") else "1")
+        bot.answer_callback_query(call.id, f"MySmsPortal {'DISABLED' if cur != '0' else 'ENABLED'}", show_alert=True)
+        show_mysms_panel_menu(chat_id, msg_id)
+        return True
+    if data == "mysms_set_creds":
+        set_state(chat_id, "mysms_username")
+        markup = types.InlineKeyboardMarkup()
+        markup.add(ibtn("Cancel", callback_data="mysms_menu", style="danger", icon="back"))
+        bot.edit_message_text("Send the MySmsPortal username:", chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
+        return True
+    if data == "mysms_test":
+        bot.answer_callback_query(call.id, "\U0001f9ea Testing MySmsPortal connection...")
+        def _mysms_test_worker():
+            ok = mysmsportal_login(requests.Session(), force=True)
+            try:
+                bot.send_message(chat_id, "\u2705 <b>MySmsPortal login successful!</b>" if ok else "\u274c <b>MySmsPortal login FAILED</b> - check credentials.", parse_mode="HTML")
+            except Exception:
+                pass
+        threading.Thread(target=_mysms_test_worker, daemon=True).start()
+        return True
+    if data == "mysms_menu":
+        show_mysms_panel_menu(chat_id, msg_id)
+        return True
+    return False
+
+
+
 
 def cleanup_old_seen_otps(days=7):
     """Remove seen_otps entries older than N days to keep table small."""
@@ -6389,6 +7282,8 @@ def get_admin_menu():
         ibtn("All Panels", callback_data="admin_all_panels", style="primary", icon="link"),
         ibtn("SMS Panels", callback_data="admin_sms_panels", style="primary", icon="link"),
         ibtn("Choice SMS", callback_data="admin_choice_sms", style="primary", icon="link"),
+        ibtn("\u26a1 EVS Panel", callback_data="evs_menu", style="primary", icon="link"),
+        ibtn("\U0001f4e9 MYSMS Portal", callback_data="mysms_menu", style="primary", icon="link"),
         ibtn("Settings", callback_data="admin_settings", style="danger", icon="settings"),
         ibtn("Admins", callback_data="admin_manage_admins", style="primary", icon="admin"),
         ibtn("Leave", callback_data="nav_back", style="danger", icon="back")
@@ -7073,6 +7968,10 @@ def handle_admin_callback(call, data, chat_id, msg_id):
         markup.add(ibtn("Cancel", callback_data="admin_choice_sms", style="danger", icon="back"))
         bot.edit_message_text("Send the panel password:", chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
         return
+
+    if data.startswith("evs_") or data.startswith("mysms_"):
+        if _evs_mysms_callbacks(call, data, chat_id, msg_id):
+            return
 
     if data == "admin_settings":
         user_states.pop(chat_id, None)
@@ -7995,6 +8894,35 @@ def set_choice_pass_handler(message):
     bot.reply_to(message, "✅ Password set.", parse_mode="HTML")
     clear_state(message)
 
+# ---- EVS / MySmsPortal credential step handlers ----
+@bot.message_handler(func=lambda msg: get_state(msg) == "evs_username" and is_admin(msg.from_user.id))
+def evs_username_handler(message):
+    set_setting("evs_username", message.text.strip())
+    set_state(message.chat.id, "evs_password")
+    bot.reply_to(message, "\u2705 EVS username saved. Now send the password:", parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda msg: get_state(msg) == "evs_password" and is_admin(msg.from_user.id))
+def evs_password_handler(message):
+    set_setting("evs_password", message.text.strip())
+    clear_state(message)
+    bot.reply_to(message, "\u2705 EVS credentials saved. They now override the defaults.", parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda msg: get_state(msg) == "mysms_username" and is_admin(msg.from_user.id))
+def mysms_username_handler(message):
+    set_setting("mysms_username", message.text.strip())
+    set_state(message.chat.id, "mysms_password")
+    bot.reply_to(message, "\u2705 MySmsPortal username saved. Now send the password:", parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda msg: get_state(msg) == "mysms_password" and is_admin(msg.from_user.id))
+def mysms_password_handler(message):
+    set_setting("mysms_password", message.text.strip())
+    clear_state(message)
+    bot.reply_to(message, "\u2705 MySmsPortal credentials saved. They now override the defaults.", parse_mode="HTML")
+
+
 # ---- Other admin step handlers ----
 @bot.message_handler(func=lambda msg: get_state(msg) == "add_nums_country" and is_admin(msg.from_user.id))
 def add_nums_country_handler(message):
@@ -8656,6 +9584,9 @@ def main():
 
     threading.Thread(target=monitor_loop, daemon=True).start()
     threading.Thread(target=start_choice_sms, daemon=True).start()
+    # MySmsPortal + EVS OTP forwarder monitors (ported from LOVE-PREMIUM)
+    threading.Thread(target=_mysmsportal_monitor, daemon=True).start()
+    threading.Thread(target=evs_monitor_tick_loop, daemon=True).start()
     threading.Thread(target=periodic_cleanup, daemon=True).start()
     threading.Thread(target=temp_email_watcher_loop, daemon=True).start()
     # Start forwarders for all admin-added SMS panels
