@@ -846,8 +846,6 @@ def _format_group_message(sms, panel_name=""):
     if full_text:
         lines.append(f"\U0001f4e9 <b>Message:</b> <code>{html_mod.escape(full_text[:300])}</code>")
     lines.append(f"\u23f0 {html_mod.escape(timestamp)}")
-    if panel_name:
-        lines.append(f"\U0001f4e1 {html_mod.escape(panel_name)}")
     lines.append(sep)
     return "\n".join(lines)
 
@@ -1808,7 +1806,6 @@ def np_format_otp_message(sms):
     if full_text:
         lines.append(f"\U0001f4e9 <b>Message:</b> <code>{html_mod.escape(full_text[:300])}</code>")
     lines.append(f"\u23f0 {html_mod.escape(timestamp)}")
-    lines.append(f"\U0001f4e1 Number Panel")
     lines.append(sep)
     return "\n".join(lines)
 
