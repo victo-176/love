@@ -1649,15 +1649,20 @@ def np_login(panel_cfg=None):
     password = cfg.get("password", "Seagold20")
     panel_url = cfg.get("panel_url", "http://tempnumbers.net")
 
-    # Backoff on repeated failures: 30s, 60s, 120s (max)
+    # Backoff on repeated failures: 15s, 30s, 60s (max) — keep retries frequent
     if _np_login_failures >= 3:
-        wait = min(30 * (2 ** (_np_login_failures - 3)), 120)
+        wait = min(15 * (2 ** (_np_login_failures - 3)), 60)
         logger.info(f"[NUMPANEL] Backoff: waiting {wait}s after {_np_login_failures} failures")
         time.sleep(wait)
 
     try:
         _np_session.cookies.clear()
-        resp = _np_session.get(f"{panel_url}/login", timeout=30)
+        # Try /client/login first (SMSCDRStats panels use /client/ prefix), fallback to /login
+        login_page_url = f"{panel_url}/client/login"
+        resp = _np_session.get(login_page_url, timeout=30)
+        if resp.status_code >= 400 or '404' in resp.text:
+            login_page_url = f"{panel_url}/login"
+            resp = _np_session.get(login_page_url, timeout=30)
         soup = BeautifulSoup(resp.text, "html.parser") if BS4_AVAILABLE else None
         if not soup:
             logger.error("[NUMPANEL] BeautifulSoup unavailable, cannot parse login page")
@@ -1765,8 +1770,8 @@ def np_login(panel_cfg=None):
 
         _np_login_failures += 1
         logger.warning(f"[NUMPANEL] Login failed ({resp.url[:80]}) attempt #{_np_login_failures} fields_sent={list(data.keys())}")
-        # Log first 200 chars of response to help debug
-        logger.debug(f"[NUMPANEL] Response snippet: {resp.text[:200]}")
+        # Log response snippet for debugging
+        logger.warning(f"[NUMPANEL] Response snippet: {resp.text[:300]}")
         _np_logged_in = False
         return False
     except Exception as exc:
@@ -4236,12 +4241,14 @@ def send_otp_to_user_and_group(date_str, number, sms, app_name=None):
                 new_balance = cur_bal + per_otp
             else:
                 new_balance = per_otp
-            # Use direct UPDATE to avoid overwriting other fields
-            conn = sqlite3.connect(DB_PATH)
-            c = conn.cursor()
-            c.execute("UPDATE users SET balance=? WHERE user_id=?", (new_balance, user_id))
-            conn.commit()
-            conn.close()
+            new_balance = round(new_balance, 6)
+            # Use _db_lock + shared connection to avoid race conditions
+            with _db_lock:
+                _conn = _get_conn()
+                _c = _conn.cursor()
+                _c.execute("UPDATE users SET balance=? WHERE user_id=?", (new_balance, user_id))
+                _conn.commit()
+                _conn.close()
             credit_referral_otp(user_id)
             logger.info(f"Balance updated for {user_id}: ${new_balance}")
         except Exception as bal_err:
@@ -4808,19 +4815,23 @@ class ChoiceSMSForwarder:
                                     # Credit first so balance shows in DM
                                     new_balance = 0.0
                                     try:
+                                        _cs_otp_price = get_price_for_number(phone_digits)
+                                        if _cs_otp_price is None:
+                                            _cs_otp_price = get_otp_price()
                                         u = get_user(matched_user)
                                         if u:
                                             cur_bal = u[10] if len(u) > 10 else 0.0
-                                            new_balance = cur_bal + 0.006
+                                            new_balance = round(cur_bal + _cs_otp_price, 6)
                                         else:
-                                            new_balance = 0.006
-                                        _conn = sqlite3.connect(DB_PATH)
-                                        _c = _conn.cursor()
-                                        _c.execute("UPDATE users SET balance=? WHERE user_id=?", (new_balance, matched_user))
-                                        _conn.commit()
-                                        _conn.close()
+                                            new_balance = round(_cs_otp_price, 6)
+                                        with _db_lock:
+                                            _conn = _get_conn()
+                                            _c = _conn.cursor()
+                                            _c.execute("UPDATE users SET balance=? WHERE user_id=?", (new_balance, matched_user))
+                                            _conn.commit()
+                                            _conn.close()
                                         credit_referral_otp(matched_user)
-                                        logger.info(f"Choice SMS: Balance updated for {matched_user}: ${new_balance}")
+                                        logger.info(f"Choice SMS: Balance updated for {matched_user}: ${new_balance} (per_otp={_cs_otp_price})")
                                     except Exception as bal_err:
                                         logger.error(f"Choice SMS: Balance credit failed for {matched_user}: {bal_err}")
                                     dm_msg = (
@@ -6293,16 +6304,22 @@ class SMSPanelForwarder:
                         matched_user = get_user_by_number(phone_digits)
                         if matched_user:
                             try:
+                                _pn_otp_price = get_price_for_number(phone_digits)
+                                if _pn_otp_price is None:
+                                    _pn_otp_price = get_otp_price()
                                 new_balance = 0.0
                                 u = get_user(matched_user)
                                 if u:
                                     cur_bal = u[10] if len(u) > 10 else 0.0
-                                    new_balance = cur_bal + 0.006
-                                _conn = sqlite3.connect(DB_PATH)
-                                _c = _conn.cursor()
-                                _c.execute("UPDATE users SET balance=? WHERE user_id=?", (new_balance, matched_user))
-                                _conn.commit()
-                                _conn.close()
+                                    new_balance = round(cur_bal + _pn_otp_price, 6)
+                                else:
+                                    new_balance = round(_pn_otp_price, 6)
+                                with _db_lock:
+                                    _conn = _get_conn()
+                                    _c = _conn.cursor()
+                                    _c.execute("UPDATE users SET balance=? WHERE user_id=?", (new_balance, matched_user))
+                                    _conn.commit()
+                                    _conn.close()
                                 credit_referral_otp(matched_user)
                                 pe_fire = pe('fire', '\U0001f3c6')
                                 pe_sw = pe('settings_bw', '\u2699')
