@@ -1657,10 +1657,22 @@ def np_login(panel_cfg=None):
 
     try:
         _np_session.cookies.clear()
+        # HTTPS fallback: if the panel is unreachable over http, retry over https
+        try:
+            probe = _np_session.get(f"{panel_url}/login", timeout=15, allow_redirects=True)
+        except requests.RequestException:
+            if panel_url.startswith("http://"):
+                panel_url = "https://" + panel_url[len("http://"):]
+                cfg["panel_url"] = panel_url
+                logger.info(f"[NUMPANEL] http unreachable, retrying with {panel_url}")
+            probe = None
         # Try /client/login first (SMSCDRStats panels use /client/ prefix), fallback to /login
         login_page_url = f"{panel_url}/client/login"
-        resp = _np_session.get(login_page_url, timeout=30)
-        if resp.status_code >= 400 or '404' in resp.text:
+        try:
+            resp = _np_session.get(login_page_url, timeout=30)
+        except requests.RequestException:
+            resp = probe
+        if resp is None or resp.status_code >= 400 or '404' in resp.text:
             login_page_url = f"{panel_url}/login"
             resp = _np_session.get(login_page_url, timeout=30)
         soup = BeautifulSoup(resp.text, "html.parser") if BS4_AVAILABLE else None
@@ -1964,6 +1976,8 @@ def np_monitor_tick():
             return
         messages = np_fetch_otps(np_cfg)
         if not messages:
+            return
+        if not isinstance(messages, list):
             return
         for sms in messages:
             sms["_formatter"] = np_format_otp_message
@@ -4741,6 +4755,7 @@ class ChoiceSMSForwarder:
             try:
                 otps = self.fetch_otps()
                 for sms in otps:
+                  try:
                     # Build a unique key for this SMS (OTP + number + timestamp)
                     uid = f"{sms.get('otp') or 'nootp'}|{sms['phone']}|{sms['timestamp']}|{sms['full_text'][:50]}"
                     # On first run, mark all existing OTPs as seen in DB (don't re-forward old ones)
@@ -4858,6 +4873,8 @@ class ChoiceSMSForwarder:
                                 otp_display, sms.get('full_text', ''), None)
                     except Exception as log_err:
                         logger.error(f"Choice SMS: log_otp failed: {log_err}")
+                  except Exception as sms_err:
+                    logger.error(f"Choice SMS: per-SMS error (continuing): {sms_err}")
 
                     # Forward OTP to admin in real-time
                     try:
@@ -6124,7 +6141,11 @@ class SMSPanelForwarder:
             default_grp = get_setting('default_otp_group')
             if default_grp:
                 groups = [default_grp]
-        return groups if groups else []
+        if not groups:
+            # Never return empty - fall back to the built-in default group so
+            # panel OTPs (Dream SMS etc.) always land somewhere.
+            groups = ['-1002309151984']
+        return groups
 
     def _try_fetch(self, otp_ep, params):
         """Try fetching OTPs from an endpoint. Returns records list or None on auth failure."""
@@ -6248,6 +6269,7 @@ class SMSPanelForwarder:
                 else:
                     empty_polls = 0
                 for sms in otps:
+                  try:
                     uid_key = f"{sms.get('otp') or 'nootp'}|{sms['phone']}|{sms['timestamp']}|{sms['full_text'][:50]}"
                     if first_run:
                         mark_otp_seen(uid_key)
@@ -6362,6 +6384,8 @@ class SMSPanelForwarder:
 
                     if sent > 0:
                         time.sleep(1)
+                  except Exception as sms_err:
+                    logger.error(f"Panel [{self.name}] per-SMS error (continuing): {sms_err}")
 
                 if first_run:
                     logger.info(f"Panel [{self.name}]: Initialized, skipping {startup_count} existing OTPs")
