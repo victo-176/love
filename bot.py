@@ -7566,9 +7566,10 @@ def process_usdt_amount(message):
         bot.reply_to(message, error, parse_mode="HTML")
         return
     address = user_states.get(user_id, {}).get("withdraw_address", "")
-    req_id = create_withdrawal_request(user_id, amount, "usdt", {"address": address})
+    wd_details = {"address": address}
+    req_id = create_withdrawal_request(user_id, amount, "usdt", wd_details)
     bot.reply_to(message, f"✅ Withdrawal request of ${amount:.2f} via USDT submitted.", parse_mode="HTML")
-    notify_admin_withdrawal(user_id, amount, "USDT", details, req_id)
+    notify_admin_withdrawal(user_id, amount, "USDT", wd_details, req_id)
     user_states.pop(user_id, None)
 
 def process_upi_id(message):
@@ -9237,6 +9238,24 @@ def combo_custom_app_handler(message):
 
 def admin_reject_reason_step(message):
     st = user_states.get(message.chat.id, {})
+    if not isinstance(st, dict):
+        st = {}
+    if isinstance(st, dict):
+        req_id = st.get("reject_reason") or ""
+    else:
+        req_id = ""
+    if not req_id:
+        # Fall back: reject the oldest pending withdrawal for this admin flow
+        try:
+            pending = get_pending_withdrawals()
+            req_id = pending[0][0] if pending else None
+        except Exception:
+            req_id = None
+    if not req_id:
+        bot.send_message(message.chat.id, "❌ No pending withdrawal to reject.", parse_mode="HTML")
+        clear_state(message)
+        show_admin_panel(message.chat.id)
+        return
     reason = message.text if message.text.lower() != '/skip' else "Rejected by admin"
     success, result = reject_withdrawal(req_id, message.chat.id, reason)
     if success:
@@ -9249,8 +9268,8 @@ def admin_reject_reason_step(message):
             try:
                 amt_str2 = f"${row[1]:.2f}"
                 bot.send_message(row[0], pe('cross', "\u274c") + " <b>Withdrawal Rejected</b>\nYour withdrawal request of " + amt_str2 + " was rejected. Your balance was not deducted.", parse_mode="HTML")
-            except:
-                pass
+            except Exception as notif_err:
+                logger.debug(f"Withdrawal reject notification failed: {notif_err}")
         conn.close()
     else:
         bot.send_message(message.chat.id, f"❌ {result}", parse_mode="HTML")
