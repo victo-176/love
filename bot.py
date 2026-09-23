@@ -1268,6 +1268,7 @@ _evs_session.headers.update({
 })
 _evs_last_hashes = set()
 _evs_logged_in = False
+_evs_blocked = False  # set when panel returns 'Direct Script Access Not Allowed'
 
 EVS_DEFAULT_CONFIG = {
     "enabled": True,
@@ -1407,6 +1408,12 @@ def evs_fetch_otps(panel_cfg=None):
                 "fgnumber": "", "fgcli": "", "fg": "0",
             }
             try:
+                # AJAX headers - panel blocks requests without these (Direct Script Access Not Allowed)
+                _evs_session.headers.update({
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Referer": cfg.get("panel_url", "") + "/agent/SMSCDRStats",
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                })
                 resp = _evs_session.get(api_url, params=params, timeout=30)
             except Exception as req_err:
                 logger.error(f"[EVS] API request error ({date}): {req_err}")
@@ -1427,7 +1434,9 @@ def evs_fetch_otps(panel_cfg=None):
             except Exception:
                 body_preview = resp.text[:200] if resp.text else ""
                 if 'direct script access' in body_preview.lower():
-                    logger.warning("[EVS] Panel blocks direct access - backing off 10 minutes")
+                    global _evs_blocked
+                    _evs_blocked = True
+                    logger.warning("[EVS] Panel blocks direct access - backing off with exponential backoff")
                     return []
                 logger.error(f"[EVS] Non-JSON API response ({date}) - body: {body_preview[:80]}")
                 _evs_logged_in = False  # session expired or panel returning HTML
@@ -1830,6 +1839,12 @@ def np_fetch_otps(panel_cfg=None):
                 "fdate1": f"{date} 00:00:00",
                 "fdate2": f"{date} 23:59:59",
             }
+            # Panels block bare script requests - send browser-like headers
+            _np_session.headers.update({
+                "Referer": stats_url,
+                "X-Requested-With": "XMLHttpRequest",
+                "Accept": "text/csv, text/plain, application/json, */*; q=0.01",
+            })
             resp = _np_session.get(export_url, params=params, timeout=30)
             if resp.status_code != 200:
                 logger.warning(f"[NUMPANEL] Export returned {resp.status_code}")
@@ -1890,15 +1905,16 @@ def np_fetch_otps(panel_cfg=None):
                     continue
                 _np_last_hashes.add(h)
 
+                record = {
+                    "otp": otp or "",
+                    "service": service,
+                    "full_text": full_text[:500],
+                    "timestamp": timestamp,
+                    "range": range_name,
+                    "number": number,
+                }
                 if _np_primed:
-                    sms_list.append({
-                        "otp": otp or "",
-                        "service": service,
-                        "full_text": full_text[:500],
-                        "timestamp": timestamp,
-                        "range": range_name,
-                        "number": number,
-                    })
+                    sms_list.append(record)
 
         except requests.RequestException as e:
             logger.error(f"[NUMPANEL] Fetch error for {date}: {e}")
@@ -1907,8 +1923,10 @@ def np_fetch_otps(panel_cfg=None):
             logger.error(f"[NUMPANEL] Parse error for {date}: {e}")
             continue
 
-    if not _np_primed and sms_list:
-        logger.info(f"[NUMPANEL] Priming: marking {len(sms_list)} existing messages as seen")
+    if not _np_primed:
+        # Prime: forget hashes of pre-existing messages so only genuinely NEW
+        # OTPs (arriving after startup) get forwarded.
+        logger.info(f"[NUMPANEL] Priming complete - existing {len(_np_last_hashes)} message(s) marked as seen")
         _np_primed = True
         return []
 
