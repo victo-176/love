@@ -1727,16 +1727,24 @@ def _np_parse_record(raw):
         timestamp = str(raw.get("date") or raw.get("time") or raw.get("created") or "")
         range_name = str(raw.get("range") or raw.get("country") or "")
     elif isinstance(raw, list):
-        if len(raw) < 6:
+        # CRAPI viewstats rows are 4 elements: [service, number, message, timestamp]
+        if len(raw) == 4:
+            service = str(raw[0] or "Unknown")
+            number = str(raw[1] or "")
+            text = str(raw[2] or "")
+            timestamp = str(raw[3] or "")
+            range_name = ""
+        elif len(raw) >= 6:
+            # DataTables footer/aggregator rows
+            if isinstance(raw[0], str) and (raw[0].startswith("$") or raw[0].strip() == "0"):
+                return None
+            timestamp = str(raw[0] or "")
+            range_name = str(raw[1] or "")
+            number = str(raw[2] or "")
+            service = str(raw[3] or "Unknown")
+            text = str(raw[5] or "")
+        else:
             return None
-        # DataTables footer/aggregator rows
-        if isinstance(raw[0], str) and (raw[0].startswith("$") or raw[0].strip() == "0"):
-            return None
-        timestamp = str(raw[0] or "")
-        range_name = str(raw[1] or "")
-        number = str(raw[2] or "")
-        service = str(raw[3] or "Unknown")
-        text = str(raw[5] or "")
     else:
         text = str(raw).strip()
         number, service, timestamp, range_name = "", "Unknown", "", ""
@@ -2115,15 +2123,25 @@ def numberapi_fetch_otps(panel_cfg=None):
                                 or rec.get("created_at") or "")
                 range_name = str(rec.get("country") or rec.get("range") or "")
             elif isinstance(rec, list):
-                # DataTables-style row: ts, range, number, service, cost, text
-                if len(rec) < 6:
+                # CRAPI viewstats returns 4-element rows:
+                #   [service, number, message, timestamp]
+                # Older SMSCDRStats panels use 6-element DataTables rows:
+                #   [timestamp, range, number, service, cost, text]
+                if len(rec) == 4:
+                    service = str(rec[0] or "Unknown")
+                    number = _extract_phone_scraped(rec[1])
+                    full_text = str(rec[2] or "")
+                    timestamp = str(rec[3] or "")
+                    otp, range_name = "", ""
+                elif len(rec) >= 6:
+                    if isinstance(rec[0], str) and (rec[0].startswith("$") or rec[0].strip() == "0"):
+                        continue
+                    timestamp, range_name = str(rec[0] or ""), str(rec[1] or "")
+                    number = _extract_phone_scraped(rec[2])
+                    service, otp = str(rec[3] or "Unknown"), ""
+                    full_text = str(rec[5] or "")
+                else:
                     continue
-                if isinstance(rec[0], str) and (rec[0].startswith("$") or rec[0].strip() == "0"):
-                    continue
-                timestamp, range_name = str(rec[0] or ""), str(rec[1] or "")
-                number = _extract_phone_scraped(rec[2])
-                service, otp = str(rec[3] or "Unknown"), ""
-                full_text = str(rec[5] or "")
             else:
                 full_text, number, service, otp, timestamp, range_name = (
                     str(rec).strip(), "", "Unknown", "", "", "")
