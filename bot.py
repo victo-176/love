@@ -1595,13 +1595,12 @@ def evs_monitor_tick_loop():
 # ==================== NUMBER PANEL (tempnumbers.net) ==============
 # ==================================================================
 NUMBERPANEL_DEFAULT_CONFIG = {
-    "username": "Darvy01",
-    "password": "Darvy01&&$$",
-    "panel_url": "http://tempnumbers.net",
-    "stats_url": "http://tempnumbers.net/agent/SMSCDRReports",
-    "login_url": "http://tempnumbers.net/login",
-    "export_url": "http://tempnumbers.net/agent/res/exportsmscdr",
-    "login_type": "agent",
+    # API panel: token in the query string, no username/password login.
+    # The token is supplied by an admin from the Number Panel menu.
+    "api_url": "http://147.135.212.197/crapi/st/viewstats",
+    "api_token": "",
+    "records": 10,
+    "login_type": "api",
     "enabled": True,
     "poll_interval": 15,
 }
@@ -1611,41 +1610,28 @@ _np_session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 })
-_np_logged_in = False
 _np_last_hashes = set()
 _np_primed = False
 
 
-def _np_creds():
-    """Admin-set credentials override hardcoded defaults."""
+def _np_token():
+    """Return the admin-supplied API token ('' if not set yet)."""
     try:
-        u = get_setting("np_username")
-        p = get_setting("np_password")
-        return (u or NUMBERPANEL_DEFAULT_CONFIG["username"],
-                p or NUMBERPANEL_DEFAULT_CONFIG["password"])
+        return (get_setting("np_api_token") or "").strip()
     except Exception:
-        return (NUMBERPANEL_DEFAULT_CONFIG["username"],
-                NUMBERPANEL_DEFAULT_CONFIG["password"])
+        return ""
 
 
 def _np_cfg():
-    """Return merged Number Panel config (admin overrides + defaults)."""
-    u, p = _np_creds()
+    """Return merged Number Panel API config (admin overrides + defaults)."""
     cfg = dict(NUMBERPANEL_DEFAULT_CONFIG)
-    cfg["username"] = u
-    cfg["password"] = p
-    # Admin may point the panel at a different host/prefix
-    for key, setting_key in (
-        ("panel_url", "np_panel_url"),
-        ("stats_url", "np_stats_url"),
-        ("export_url", "np_export_url"),
-    ):
-        try:
-            override = get_setting(setting_key)
-        except Exception:
-            override = None
-        if override:
-            cfg[key] = override.rstrip("/")
+    cfg["api_token"] = _np_token()
+    try:
+        api_url = get_setting("np_api_url")
+    except Exception:
+        api_url = None
+    if api_url:
+        cfg["api_url"] = api_url.strip().rstrip("/")
     try:
         cfg["enabled"] = get_setting("np_enabled") != "0"
     except Exception:
@@ -1657,178 +1643,125 @@ def _np_enabled():
     return _np_cfg().get("enabled", True)
 
 
-_np_login_failures = 0  # consecutive login failures for backoff
+
+_np_api_failures = 0  # consecutive API failures for backoff
 
 
-def np_login(panel_cfg=None):
-    """Login to Number Panel (tempnumbers.net) with math captcha.
-    Extracts CSRF token and all hidden form fields dynamically."""
-    global _np_logged_in, _np_login_failures
+def np_api_validate(panel_cfg=None):
+    """Validate the admin-supplied API token with a minimal request."""
     cfg = panel_cfg or _np_cfg()
-    username = cfg.get("username", NUMBERPANEL_DEFAULT_CONFIG["username"])
-    password = cfg.get("password", NUMBERPANEL_DEFAULT_CONFIG["password"])
-    panel_url = cfg.get("panel_url", "http://tempnumbers.net").rstrip("/")
-
-    # Backoff on repeated failures: 15s, 30s, 60s (max) — keep retries frequent
-    if _np_login_failures >= 3:
-        wait = min(15 * (2 ** (_np_login_failures - 3)), 60)
-        logger.info(f"[NUMPANEL] Backoff: waiting {wait}s after {_np_login_failures} failures")
-        time.sleep(wait)
-
-    try:
-        _np_session.cookies.clear()
-        # HTTPS fallback: if the panel is unreachable over http, retry over https
-        try:
-            probe = _np_session.get(f"{panel_url}/login", timeout=15, allow_redirects=True)
-        except requests.RequestException:
-            if panel_url.startswith("http://"):
-                panel_url = "https://" + panel_url[len("http://"):]
-                cfg["panel_url"] = panel_url
-                logger.info(f"[NUMPANEL] http unreachable, retrying with {panel_url}")
-            probe = None
-        # Confirmed login page is /login; keep an agent/client fallback for safety
-        login_page_url = f"{panel_url}/login"
-        try:
-            resp = _np_session.get(login_page_url, timeout=30)
-        except requests.RequestException:
-            resp = probe
-        if resp is None or resp.status_code >= 400 or '404' in resp.text:
-            login_type = cfg.get("login_type", "agent")
-            login_page_url = f"{panel_url}/{login_type}/login"
-            resp = _np_session.get(login_page_url, timeout=30)
-        soup = BeautifulSoup(resp.text, "html.parser") if BS4_AVAILABLE else None
-        if not soup:
-            logger.error("[NUMPANEL] BeautifulSoup unavailable, cannot parse login page")
-            _np_login_failures += 1
-            _np_logged_in = False
-            return False
-
-        # --- Extract CSRF token and all hidden fields from the form ---
-        data = {}
-        login_form = soup.find("form")
-        if login_form:
-            for inp in login_form.find_all("input"):
-                name = inp.get("name")
-                if not name:
-                    continue
-                val = inp.get("value", "")
-                input_type = (inp.get("type") or "text").lower()
-                if name.lower() in ("username", "user"):
-                    data[name] = username
-                elif name.lower() in ("password", "pass"):
-                    data[name] = password
-                elif name.lower() == "remember-me":
-                    data[name] = "1"
-                elif input_type == "hidden":
-                    data[name] = val
-                elif name.lower() not in data:
-                    # Preserve other visible fields (captcha input etc.)
-                    data[name] = val
-        else:
-            # Fallback if no <form> found
-            data = {"username": username, "password": password, "remember-me": "1"}
-
-        # Make sure username/password are always set
-        if "username" not in data and "user" not in data:
-            data["username"] = username
-        if "password" not in data and "pass" not in data:
-            data["password"] = password
-        if "remember-me" not in data:
-            data["remember-me"] = "1"
-
-        # --- Solve captcha ---
-        nums = []
-        captcha_el = soup.find(id="captcha-question") or soup.find(class_="captcha")
-        if captcha_el:
-            nums = re.findall(r"(\d+)\s*\+\s*(\d+)", captcha_el.get_text())
-        if not nums:
-            nums = re.findall(r"(\d+)\s*\+\s*(\d+)", soup.get_text())
-        if nums:
-            captcha_val = str(int(nums[0][0]) + int(nums[0][1]))
-            logger.info(f"[NUMPANEL] Captcha: {nums[0][0]} + {nums[0][1]} = {captcha_val}")
-            # Set captcha in whatever field name the form uses
-            captcha_field = None
-            if login_form:
-                for inp in login_form.find_all("input"):
-                    n = (inp.get("name") or "").lower()
-                    if n in ("capt", "captcha", "captcha_answer", "answer"):
-                        captcha_field = inp.get("name")
-                        break
-            data[captcha_field or "capt"] = captcha_val
-
-        # --- Determine login action URL ---
-        login_action = f"{panel_url}/signin"
-        if login_form and login_form.get("action"):
-            action = login_form["action"].strip()
-            if action.startswith("http"):
-                login_action = action
-            elif action.startswith("/"):
-                login_action = f"{panel_url}{action}"
-            else:
-                login_action = f"{panel_url}/{action}"
-
-        # --- Set Referer for the POST ---
-        _np_session.headers["Referer"] = f"{panel_url}/login"
-
-        logger.info(f"[NUMPANEL] POST {login_action} fields={list(data.keys())}")
-        resp = _np_session.post(login_action, data=data, timeout=30, allow_redirects=True)
-        final_url = resp.url.lower()
-        resp_html = resp.text.lower()
-
-        # --- Detect login success ---
-        if "dashboard" in final_url or "smcdrstats" in final_url or "smcdrreports" in final_url or "home" in final_url:
-            _np_logged_in = True
-            _np_login_failures = 0
-            logger.info("[NUMPANEL] Login successful!")
-            return True
-        if "signin" not in final_url and "login" not in final_url:
-            _np_logged_in = True
-            _np_login_failures = 0
-            logger.info("[NUMPANEL] Login successful (redirect away from login)!")
-            return True
-        has_login_form = 'type="password"' in resp_html or 'name="password"' in resp_html
-        has_dashboard = ('smcdrstats' in resp_html or 'smcdrreports' in resp_html
-                         or 'sms reports' in resp_html or 'side-nav' in resp_html
-                         or 'exportsmscdr' in resp_html or 'export' in resp_html)
-        if not has_login_form and has_dashboard:
-            _np_logged_in = True
-            _np_login_failures = 0
-            logger.info("[NUMPANEL] Login successful (dashboard content)!")
-            return True
-        # Additional: check if cookies were set (some panels redirect to login but session is valid)
-        cookies = dict(_np_session.cookies)
-        if cookies and not has_login_form:
-            _np_logged_in = True
-            _np_login_failures = 0
-            logger.info("[NUMPANEL] Login successful (cookies set, no login form)!")
-            return True
-
-        _np_login_failures += 1
-        logger.warning(f"[NUMPANEL] Login failed ({resp.url[:80]}) attempt #{_np_login_failures} fields_sent={list(data.keys())}")
-        # Log response snippet for debugging
-        logger.warning(f"[NUMPANEL] Response snippet: {resp.text[:300]}")
-        _np_logged_in = False
+    token = cfg.get("api_token", "")
+    if not token:
+        logger.warning("[NUMPANEL] No API token set - add it from Admin > Number Panel.")
         return False
-    except Exception as exc:
-        _np_login_failures += 1
-        logger.error(f"[NUMPANEL] Login error: {exc}")
-        _np_logged_in = False
-        return False
-
-
-def _np_get_sesskey(stats_url):
-    """Extract sesskey from the SMSCDRStats page."""
+    api_url = cfg.get("api_url", NUMBERPANEL_DEFAULT_CONFIG["api_url"])
     try:
-        resp = _np_session.get(stats_url, timeout=30)
-        if resp.status_code != 200:
+        _np_session.headers.update({
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/json, text/plain, */*; q=0.01",
+            "Referer": api_url.rsplit("/", 1)[0],
+        })
+        resp = _np_session.get(api_url, params={"token": token, "records": 1}, timeout=30)
+    except requests.RequestException as e:
+        logger.error(f"[NUMPANEL] API token check error: {e}")
+        return False
+    if resp.status_code in (401, 403):
+        logger.error(f"[NUMPANEL] API token rejected ({resp.status_code}).")
+        return False
+    if resp.status_code != 200:
+        logger.error(f"[NUMPANEL] API token check failed ({resp.status_code}): {(resp.text or '')[:120]}")
+        return False
+    logger.info("[NUMPANEL] API token OK")
+    return True
+
+
+def _np_api_records(cfg):
+    """GET the API endpoint and return the raw record list ([] on soft failure)."""
+    global _np_api_failures
+    token = cfg.get("api_token", "")
+    api_url = cfg.get("api_url", NUMBERPANEL_DEFAULT_CONFIG["api_url"])
+    records_n = cfg.get("records", 10)
+    try:
+        _np_session.headers.update({
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/json, text/plain, */*; q=0.01",
+            "Referer": api_url.rsplit("/", 1)[0],
+        })
+        resp = _np_session.get(api_url, params={"token": token, "records": records_n}, timeout=30)
+    except requests.RequestException as e:
+        _np_api_failures += 1
+        logger.error(f"[NUMPANEL] API fetch error: {e}")
+        return None
+    if resp.status_code in (401, 403):
+        _np_api_failures += 1
+        logger.error(f"[NUMPANEL] API auth failed ({resp.status_code}) - token may be wrong or expired.")
+        return None
+    if resp.status_code != 200:
+        logger.warning(f"[NUMPANEL] API returned {resp.status_code}: {(resp.text or '')[:120]}")
+        return []
+    try:
+        data = resp.json()
+    except ValueError:
+        # Some deployments answer with newline-delimited text instead of JSON
+        logger.warning("[NUMPANEL] API non-JSON response - falling back to text parse")
+        return [ln for ln in (resp.text or "").splitlines() if ln.strip()]
+    if isinstance(data, dict):
+        for key in ("records", "data", "results", "otps", "sms", "viewstats"):
+            val = data.get(key)
+            if isinstance(val, list):
+                return val
+        return []
+    if isinstance(data, list):
+        return data
+    return []
+
+
+def _np_parse_record(raw):
+    """Normalise one API record into an sms dict, or None if it has no OTP."""
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        text = str(raw.get("text") or raw.get("message") or raw.get("sms") or "")
+        number = str(raw.get("number") or raw.get("phone") or "")
+        service = str(raw.get("service") or "Unknown")
+        timestamp = str(raw.get("date") or raw.get("time") or raw.get("created") or "")
+        range_name = str(raw.get("range") or raw.get("country") or "")
+    elif isinstance(raw, list):
+        if len(raw) < 6:
             return None
-        m = re.search(r"sesskey=([A-Za-z0-9]+)", resp.text)
-        if m:
-            return m.group(1)
+        # DataTables footer/aggregator rows
+        if isinstance(raw[0], str) and (raw[0].startswith("$") or raw[0].strip() == "0"):
+            return None
+        timestamp = str(raw[0] or "")
+        range_name = str(raw[1] or "")
+        number = str(raw[2] or "")
+        service = str(raw[3] or "Unknown")
+        text = str(raw[5] or "")
+    else:
+        text = str(raw).strip()
+        number, service, timestamp, range_name = "", "Unknown", "", ""
+
+    if not text:
         return None
-    except Exception as e:
-        logger.error(f"[NUMPANEL] sesskey extraction error: {e}")
+
+    number = re.sub(r"\D", "", number)
+    if len(number) < 7:
+        pm = re.search(r"(\+?\d{10,15})", text)
+        number = re.sub(r"\D", "", pm.group(1)) if pm else ""
+    if len(number) < 7:
         return None
+
+    otp = _np_extract_otp(text)
+    if not otp:
+        return None
+    return {
+        "otp": otp,
+        "service": service,
+        "full_text": text[:500],
+        "timestamp": timestamp or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "range": range_name,
+        "number": number,
+    }
 
 
 def _np_extract_otp(full_text):
@@ -1850,243 +1783,40 @@ def _np_extract_otp(full_text):
     return ""
 
 
-def _np_fetch_json_api(cfg, stats_url):
-    """Try the JSON data_smscdr.php endpoint (agent/client) for today's+yesterday's records.
-    Returns a list of parsed SMS dicts, or None if no endpoint returned usable JSON."""
-    global _np_logged_in
-    panel_url = cfg.get("panel_url", "http://tempnumbers.net").rstrip("/")
-    login_type = cfg.get("login_type", "agent")
-    api_paths = [
-        f"{panel_url}/{login_type}/res/data_smscdr.php",
-        f"{panel_url}/agent/res/data_smscdr.php",
-        f"{panel_url}/client/res/data_smscdr.php",
-        f"{panel_url}/res/data_smscdr.php",
-    ]
-    # Deduplicate while preserving order
-    seen, unique_paths = set(), []
-    for p in api_paths:
-        if p not in seen:
-            seen.add(p)
-            unique_paths.append(p)
-
-    today = datetime.now().strftime("%Y-%m-%d")
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-
-    for path in unique_paths:
-        collected = []
-        endpoint_ok = False
-        for date in [today, yesterday]:
-            params = {
-                "draw": "1", "start": "0", "length": "100",
-                "search[value]": "", "search[regex]": "false",
-                "order[0][column]": "0", "order[0][dir]": "asc",
-                "fdate1": f"{date} 00:00:00", "fdate2": f"{date} 23:59:59",
-                "frange": "", "fclient": "", "fnum": "", "fcli": "",
-                "fgdate": "", "fgmonth": "", "fgrange": "", "fgclient": "",
-                "fgnumber": "", "fgcli": "", "fg": "0",
-            }
-            try:
-                _np_session.headers.update({
-                    "Referer": stats_url,
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Accept": "application/json, text/javascript, */*; q=0.01",
-                })
-                resp = _np_session.get(path, params=params, timeout=30)
-            except requests.RequestException as e:
-                logger.warning(f"[NUMPANEL] API request error on {path}: {e}")
-                break
-            if resp.status_code in (401, 403):
-                logger.warning(f"[NUMPANEL] API auth failure {resp.status_code} on {path}")
-                _np_logged_in = False
-                return None
-            if resp.status_code != 200:
-                break
-            # Session may have expired and bounced us to the login page
-            if "login" in resp.url.lower() or "signin" in resp.url.lower():
-                logger.warning("[NUMPANEL] Session expired during JSON API fetch.")
-                _np_logged_in = False
-                return None
-            try:
-                payload = resp.json()
-            except Exception:
-                # HTML (login wall or 'Direct Script Access Not Allowed') - try next path
-                logger.warning(f"[NUMPANEL] Non-JSON response from {path}")
-                break
-
-            endpoint_ok = True
-            records = []
-            if isinstance(payload, dict):
-                records = payload.get("aaData") or payload.get("data") or []
-            elif isinstance(payload, list):
-                records = payload
-
-            for record in records:
-                if isinstance(record, dict):
-                    timestamp = str(record.get("date") or record.get("time") or "")
-                    range_name = str(record.get("range") or "")
-                    number = str(record.get("number") or record.get("phone") or "")
-                    service = str(record.get("service") or "Unknown")
-                    full_text = str(record.get("text") or record.get("message") or "")
-                else:
-                    if not isinstance(record, list) or len(record) < 6:
-                        continue
-                    # Skip DataTables footer/aggregator rows
-                    if isinstance(record[0], str) and (record[0].startswith("$") or record[0].strip() == "0"):
-                        continue
-                    timestamp = str(record[0] or "")
-                    range_name = str(record[1] or "")
-                    number = str(record[2] or "")
-                    service = str(record[3] or "Unknown")
-                    full_text = str(record[5] or "")
-                if not full_text:
-                    continue
-                collected.append({
-                    "otp": "",
-                    "service": service,
-                    "full_text": full_text[:500],
-                    "timestamp": timestamp,
-                    "range": range_name,
-                    "number": re.sub(r"\D", "", number),
-                })
-        if endpoint_ok:
-            if collected:
-                logger.info(f"[NUMPANEL] JSON API returned {len(collected)} records via {path}")
-            return collected
-    return None
-
-
 def np_fetch_otps(panel_cfg=None):
-    """Fetch OTPs from Number Panel: JSON data_smscdr.php first, CSV export as fallback."""
-    global _np_logged_in, _np_last_hashes, _np_primed
+    """Fetch OTPs from the Number Panel API (token auth, no session login)."""
+    global _np_last_hashes, _np_primed, _np_api_failures
     cfg = panel_cfg or _np_cfg()
-    panel_url = cfg.get("panel_url", "http://tempnumbers.net").rstrip("/")
-    export_url = cfg.get("export_url", "http://tempnumbers.net/agent/res/exportsmscdr")
-    stats_url = cfg.get("stats_url", "http://tempnumbers.net/agent/SMSCDRReports")
+    if not cfg.get("api_token"):
+        return []
 
-    if not _np_logged_in:
-        if not np_login(cfg):
-            return []
+    records = _np_api_records(cfg)
+    if records is None:
+        return []
+    if not records:
+        _np_api_failures = 0
+        return []
 
-    # --- Primary path: JSON API ---
-    json_records = _np_fetch_json_api(cfg, stats_url)
-    if json_records is not None:
-        sms_list = []
-        for rec in json_records:
-            number = rec.get("number") or ""
-            full_text = rec.get("full_text", "")
-            if not number:
-                pm = re.search(r"(\+?\d{10,15})", full_text)
-                number = re.sub(r"\D", "", pm.group(1)) if pm else ""
-            if len(number) < 7:
-                continue
-            otp = _np_extract_otp(full_text)
-            h = hashlib.md5(f"{number}|{otp or 'nootp'}".encode()).hexdigest()
-            if h in _np_last_hashes:
-                continue
-            _np_last_hashes.add(h)
-            rec["otp"] = otp or ""
-            rec["number"] = number
-            if _np_primed:
-                sms_list.append(rec)
-        if not _np_primed:
-            logger.info(f"[NUMPANEL] Priming complete - existing {len(_np_last_hashes)} message(s) marked as seen")
-            _np_primed = True
-            return []
-        if sms_list:
-            logger.info(f"[NUMPANEL] Found {len(sms_list)} new OTPs (JSON API)")
-        return sms_list
-
-    # --- Fallback path: CSV export ---
     sms_list = []
-    today = datetime.now().strftime("%Y-%m-%d")
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-
-    for date in [today, yesterday]:
-        try:
-            params = {
-                "fdate1": f"{date} 00:00:00",
-                "fdate2": f"{date} 23:59:59",
-            }
-            # Panels block bare script requests - send browser-like headers
-            _np_session.headers.update({
-                "Referer": stats_url,
-                "X-Requested-With": "XMLHttpRequest",
-                "Accept": "text/csv, text/plain, application/json, */*; q=0.01",
-            })
-            resp = _np_session.get(export_url, params=params, timeout=30)
-            if resp.status_code != 200:
-                logger.warning(f"[NUMPANEL] Export returned {resp.status_code}")
-                if resp.status_code in (401, 403):
-                    _np_logged_in = False
-                    return None
-                continue
-            if "login" in resp.url.lower() or "signin" in resp.url.lower():
-                logger.warning("[NUMPANEL] Session expired during export fetch.")
-                _np_logged_in = False
-                return None
-
-            # Parse CSV lines
-            for line in resp.text.splitlines():
-                line = line.strip()
-                if not line or not re.match(r"\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}", line):
-                    continue
-                # CSV format: timestamp, range, number, service, ... message
-                parts = line.split(", ", 5) if ", " in line else line.split(",", 5)
-                if len(parts) < 5:
-                    continue
-                timestamp = parts[0].strip()
-                range_name = parts[1].strip() if len(parts) > 1 else ""
-                number_raw = parts[2].strip() if len(parts) > 2 else ""
-                service = parts[3].strip() if len(parts) > 3 else "Unknown"
-                full_text = parts[4].strip() if len(parts) > 4 else ""
-
-                # Extract number (digits only)
-                number = re.sub(r"\D", "", number_raw)
-                if len(number) < 7:
-                    continue
-
-                # Phone-hijack guard
-                lower_text = full_text.lower()
-                if any(kw in lower_text for kw in ["username:", "password:", "user:", "pass:"]):
-                    # Don't let credential text override the number
-                    pass
-
-                # OTP extraction - alphanumeric supported
-                otp = _np_extract_otp(full_text)
-
-                h = hashlib.md5(f"{number}|{otp or 'nootp'}".encode()).hexdigest()
-                if h in _np_last_hashes:
-                    continue
-                _np_last_hashes.add(h)
-
-                record = {
-                    "otp": otp or "",
-                    "service": service,
-                    "full_text": full_text[:500],
-                    "timestamp": timestamp,
-                    "range": range_name,
-                    "number": number,
-                }
-                if _np_primed:
-                    sms_list.append(record)
-
-        except requests.RequestException as e:
-            logger.error(f"[NUMPANEL] Fetch error for {date}: {e}")
+    for raw in records:
+        rec = _np_parse_record(raw)
+        if not rec:
             continue
-        except Exception as e:
-            logger.error(f"[NUMPANEL] Parse error for {date}: {e}")
+        h = hashlib.md5(f"{rec['number']}|{rec['otp']}".encode()).hexdigest()
+        if h in _np_last_hashes:
             continue
+        _np_last_hashes.add(h)
+        if _np_primed:
+            sms_list.append(rec)
 
     if not _np_primed:
-        # Prime: forget hashes of pre-existing messages so only genuinely NEW
-        # OTPs (arriving after startup) get forwarded.
         logger.info(f"[NUMPANEL] Priming complete - existing {len(_np_last_hashes)} message(s) marked as seen")
         _np_primed = True
         return []
 
+    _np_api_failures = 0
     if sms_list:
         logger.info(f"[NUMPANEL] Found {len(sms_list)} new OTPs")
-
     return sms_list
 
 
@@ -2167,7 +1897,7 @@ def np_monitor_tick_loop():
         except Exception as e:
             logger.error(f"[NUMPANEL MONITOR] loop error: {e}", exc_info=True)
         # When login is failing, slow down the loop to reduce log spam
-        sleep_time = 60 if _np_login_failures >= 5 else 15
+        sleep_time = 60 if _np_api_failures >= 5 else 15
         time.sleep(sleep_time)
 
 
@@ -2175,22 +1905,22 @@ def show_np_panel_menu(chat_id, message_id=None):
     """Admin menu for Number Panel."""
     cfg = _np_cfg()
     enabled = cfg.get("enabled", True)
-    username = cfg.get("username", "")
+    token = cfg.get("api_token", "")
     status = "\U0001f7e2 ACTIVE" if enabled else "\U0001f534 DISABLED"
-    user_status = f"\U0001f464 {username}" if username else "\u274c Not set"
+    token_status = "\U0001f511 Set" if token else "\u274c Not set"
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(ibtn(f"\u26a1 {'DISABLE' if enabled else 'ENABLE'}", callback_data="np_toggle",
                     style="danger" if enabled else "success"))
-    markup.add(ibtn("\U0001f464 SET CREDENTIALS", callback_data="np_set_creds", style="primary"))
+    markup.add(ibtn("\U0001f511 SET API TOKEN", callback_data="np_set_token", style="primary"))
     markup.add(ibtn("\U0001f9ea TEST CONNECTION", callback_data="np_test", style="success"),
                ibtn("\U0001f519 BACK", callback_data="admin_panel", style="primary"))
     text = (
         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-        f"\U0001f4f1 <b>NUMBER PANEL</b>\n"
+        f"\U0001f4f1 <b>NUMBER PANEL (API)</b>\n"
         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
         f"\U0001f4ca <b>Status:</b> {status}\n"
-        f"\U0001f464 <b>Credentials:</b> {user_status}\n"
-        f"\U0001f517 <b>Panel:</b> <code>{html_mod.escape(str(cfg.get('panel_url', 'Not set')))}</code>\n"
+        f"\U0001f511 <b>API Token:</b> {token_status}\n"
+        f"\U0001f517 <b>Endpoint:</b> <code>{html_mod.escape(str(cfg.get('api_url', 'Not set')))}</code>\n"
         f"\u23f1 <b>Poll Interval:</b> {cfg.get('poll_interval', 15)}s\n"
         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
     )
@@ -2323,18 +2053,18 @@ def _evs_mysms_callbacks(call, data, chat_id, msg_id):
         bot.answer_callback_query(call.id, f"Number Panel {'DISABLED' if cur != '0' else 'ENABLED'}", show_alert=True)
         show_np_panel_menu(chat_id, msg_id)
         return True
-    if data == "np_set_creds":
-        set_state(chat_id, {"np_step": "username"})
+    if data == "np_set_token":
+        set_state(chat_id, {"np_step": "token"})
         markup = types.InlineKeyboardMarkup()
         markup.add(ibtn("Cancel", callback_data="np_menu", style="danger", icon="back"))
-        bot.edit_message_text("Send the Number Panel username:", chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
+        bot.edit_message_text("\U0001f511 Send the Number Panel API token:", chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
         return True
     if data == "np_test":
-        bot.answer_callback_query(call.id, "\U0001f9ea Testing Number Panel connection...")
+        bot.answer_callback_query(call.id, "\U0001f9ea Testing Number Panel API...")
         def _np_test_worker():
-            ok = np_login(_np_cfg())
+            ok = np_api_validate(_np_cfg())
             try:
-                bot.send_message(chat_id, "\u2705 <b>Number Panel login successful!</b>" if ok else "\u274c <b>Number Panel login FAILED</b> - check credentials.", parse_mode="HTML")
+                bot.send_message(chat_id, "\u2705 <b>Number Panel API token OK!</b>" if ok else "\u274c <b>Number Panel API test FAILED</b> - check the token/endpoint.", parse_mode="HTML")
             except Exception:
                 pass
         threading.Thread(target=_np_test_worker, daemon=True).start()
@@ -10076,38 +9806,24 @@ def broadcast_handler(message):
 
 
 
-# ======================== NUMBER PANEL CREDENTIAL HANDLERS ========================
-@bot.message_handler(func=lambda msg: isinstance(get_state(msg), dict) and get_state(msg).get("np_step") == "username" and is_admin(msg.from_user.id))
-def np_username_handler(message):
-    username = message.text.strip()
-    if not username:
-        bot.reply_to(message, "\u274c Username cannot be empty.", parse_mode="HTML")
+# ======================== NUMBER PANEL API TOKEN HANDLER ========================
+@bot.message_handler(func=lambda msg: isinstance(get_state(msg), dict) and get_state(msg).get("np_step") == "token" and is_admin(msg.from_user.id))
+def np_token_handler(message):
+    """Admin pastes the Number Panel API token (stored, never echoed back in full)."""
+    token = (message.text or "").strip()
+    if not token:
+        bot.reply_to(message, "\u274c Token cannot be empty. Send the API token:", parse_mode="HTML")
         return
-    state = get_state(message)
-    state["np_user"] = username
-    state["np_step"] = "password"
-    set_state(message.chat.id, state)
-    markup = types.InlineKeyboardMarkup()
-    markup.add(ibtn("Cancel", callback_data="np_menu", style="danger", icon="back"))
-    bot.reply_to(message, pe("lock", "\U0001f510") + " Send the Number Panel password:", parse_mode="HTML", reply_markup=markup)
-
-
-@bot.message_handler(func=lambda msg: isinstance(get_state(msg), dict) and get_state(msg).get("np_step") == "password" and is_admin(msg.from_user.id))
-def np_password_handler(message):
-    password = message.text.strip()
-    state = get_state(message)
-    username = state.get("np_user", "")
-    set_setting("np_username", username)
-    set_setting("np_password", password)
+    set_setting("np_api_token", token)
     clear_state(message)
     markup = types.InlineKeyboardMarkup()
     markup.add(ibtn("Number Panel", callback_data="np_menu", style="success", icon="link"))
     markup.add(ibtn("Back", callback_data="admin_panel", style="primary", icon="back"))
     bot.reply_to(message,
-        pe("checkmark", "\u2705") + " <b>Number Panel credentials saved!</b>\n\n"
-        + pe("profile", "\U0001f464") + " <b>Username:</b> <code>" + html_mod.escape(username) + "</code>\n"
-        + pe("lock", "\U0001f510") + " <b>Password:</b> <code>" + html_mod.escape(password) + "</code>\n\n"
-        "The panel will use these credentials on next login.",
+        pe("checkmark", "\u2705") + " <b>Number Panel API token saved!</b>\n\n"
+        + pe("key", "\U0001f511") + " Token: <code>" + html_mod.escape(token[:8] + "...") + "</code>\n"
+        + pe("link", "\U0001f517") + " Endpoint: <code>" + html_mod.escape(_np_cfg().get("api_url", "")) + "</code>\n\n"
+        "The poller will use it on the next cycle. Use TEST CONNECTION to verify.",
         parse_mode="HTML", reply_markup=markup)
 
 
