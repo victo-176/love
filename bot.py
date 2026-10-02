@@ -8135,6 +8135,236 @@ def admin_edit_setting_start(call, key):
     except Exception:
         pass
 
+# ==========================================================
+# === ADDED: DATABASE BACKUP / RESTORE (ADMIN) =============
+# ==========================================================
+# Tables a restored file must contain to be accepted.
+DB_REQUIRED_TABLES = ("users", "bot_settings")
+
+
+def db_size(path=None):
+    try:
+        return os.path.getsize(path or DB_PATH)
+    except OSError:
+        return 0
+
+
+def db_table_names(path):
+    """Return the set of table names in a SQLite file (empty set if unreadable)."""
+    try:
+        conn = sqlite3.connect(path, timeout=15)
+        rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        conn.close()
+        return {r[0] for r in rows}
+    except Exception as e:
+        logger.error(f"[DB BACKUP] table scan failed: {e}")
+        return set()
+
+
+def db_export_snapshot(dest_path):
+    """Write a consistent copy of the live DB to dest_path via SQLite's backup API.
+
+    Safe to run while the bot holds WAL connections open. Returns True on success.
+    """
+    try:
+        src = sqlite3.connect(DB_PATH, timeout=30)
+        dst = sqlite3.connect(dest_path, timeout=30)
+        with dst:
+            src.backup(dst)
+        dst.close()
+        src.close()
+        return True
+    except Exception as e:
+        logger.error(f"[DB BACKUP] export failed: {e}")
+        return False
+
+
+def _db_wal_paths(path):
+    """WAL sidecar files that must be cleared when swapping the database in."""
+    return [path + "-wal", path + "-shm", path + "-journal"]
+
+
+def db_validate_candidate(path):
+    """Return (ok, reason). Confirms the upload is a real SQLite DB we can use."""
+    if not os.path.isfile(path):
+        return False, "file not found"
+    try:
+        if os.path.getsize(path) < 1024:
+            return False, "file is too small to be a database"
+        with open(path, "rb") as fh:
+            header = fh.read(16)
+    except OSError as e:
+        return False, f"cannot read file: {e}"
+    if header[:15] != b"SQLite format 3":
+        return False, "not a SQLite database"
+    tables = db_table_names(path)
+    if not tables:
+        return False, "no tables found in file"
+    missing = [t for t in DB_REQUIRED_TABLES if t not in tables]
+    if missing:
+        return False, "missing required table(s): " + ", ".join(missing)
+    return True, "ok"
+
+
+def show_db_backup_menu(chat_id, message_id=None):
+    """Admin menu for database backup and restore."""
+    size_mb = db_size() / (1024 * 1024)
+    text = (
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"\U0001f5c2 <b>DATABASE BACKUP</b>\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+        f"\U0001f4ca <b>Size:</b> <code>{size_mb:.2f} MB</code>\n"
+        f"\U0001f5c3 <b>Tables:</b> <code>{len(db_table_names(DB_PATH))}</code>\n\n"
+        f"\u2139\ufe0f <b>Download</b> sends a full snapshot to you.\n"
+        f"\u26a0\ufe0f <b>Upload</b> replaces ALL live data. A backup is kept automatically."
+    )
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(ibtn("\U0001f4e6 DOWNLOAD DB", callback_data="admin_db_export", style="success", icon="archive"),
+               ibtn("\U0001f4e4 UPLOAD DB", callback_data="admin_db_import", style="danger", icon="upload"))
+    markup.add(ibtn("\U0001f519 BACK", callback_data="admin_panel", style="primary", icon="back"))
+    if message_id:
+        try:
+            _safe_edit_message_text(text, chat_id=chat_id, message_id=message_id,
+                                    parse_mode="HTML", reply_markup=markup)
+            return
+        except Exception:
+            pass
+    _safe_send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
+
+
+def admin_db_export_worker(chat_id):
+    """Build a snapshot and send it to the admin as a document."""
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(PERSISTENT_DIR, f"bot-backup-{stamp}.db")
+    try:
+        if not db_export_snapshot(path):
+            bot.send_message(chat_id, "\u274c <b>Export failed</b> - see server logs.", parse_mode="HTML")
+            return
+        size_mb = os.path.getsize(path) / (1024 * 1024)
+        caption = (f"\U0001f5c2 <b>Database backup</b>\n"
+                   f"\U0001f4c5 {stamp}\n"
+                   f"\U0001f4ca Size: {size_mb:.2f} MB\n"
+                   f"\U0001f5c3 Tables: {len(db_table_names(path))}\n\n"
+                   "Keep this safe - uploading it back replaces all live data.")
+        with open(path, "rb") as fh:
+            bot.send_document(chat_id, fh, caption=caption, parse_mode="HTML")
+        logger.info(f"[DB BACKUP] exported snapshot ({size_mb:.2f} MB)")
+    except Exception as e:
+        logger.error(f"[DB BACKUP] export send failed: {e}")
+        try:
+            bot.send_message(chat_id, "\u274c <b>Export failed:</b> " + html_mod.escape(str(e)[:150]),
+                             parse_mode="HTML")
+        except Exception:
+            pass
+    finally:
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+
+@bot.message_handler(func=lambda msg: msg.content_type == "document"
+                     and isinstance(get_state(msg), dict)
+                     and get_state(msg).get("db_step") == "await_upload"
+                     and ((msg.document.file_name or "").lower().endswith((".db", ".sqlite", ".sqlite3")))
+                     and is_admin(msg.from_user.id))
+def db_upload_handler(message):
+    """Receive a .db upload, validate it, then swap it in as the live database."""
+    chat_id = message.chat.id
+    doc = message.document
+    fname = doc.file_name or "backup.db"
+    tmp_path = os.path.join(PERSISTENT_DIR, f"upload-{int(time.time())}.db")
+    status_msg = None
+    try:
+        status_msg = bot.reply_to(message, "\U0001f4e4 <b>Downloading database...</b>", parse_mode="HTML")
+    except Exception:
+        pass
+
+    def _say(text):
+        try:
+            if status_msg:
+                bot.edit_message_text(text, chat_id, status_msg.message_id, parse_mode="HTML")
+            else:
+                bot.send_message(chat_id, text, parse_mode="HTML")
+        except Exception:
+            try:
+                bot.send_message(chat_id, text, parse_mode="HTML")
+            except Exception:
+                pass
+
+    try:
+        file_info = bot.get_file(doc.file_id)
+        content = bot.download_file(file_info.file_path)
+        with open(tmp_path, "wb") as fh:
+            fh.write(content)
+    except Exception as e:
+        logger.error(f"[DB RESTORE] download failed: {e}")
+        _say("\u274c <b>Download failed:</b> " + html_mod.escape(str(e)[:150]))
+        clear_state(message)
+        return
+
+    ok, reason = db_validate_candidate(tmp_path)
+    if not ok:
+        logger.warning(f"[DB RESTORE] rejected upload: {reason}")
+        _say("\u274c <b>Upload rejected:</b> " + html_mod.escape(reason) +
+             "\n\nThe live database was NOT changed.")
+        clear_state(message)
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        return
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    safety = os.path.join(PERSISTENT_DIR, f"bot-preimport-{stamp}.db")
+    try:
+        # 1) Always keep the current data before overwriting it.
+        db_export_snapshot(safety)
+        # 2) Serialise writers, then swap the file and clear WAL sidecars.
+        with _db_lock:
+            conn = _get_conn()
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                pass
+            conn.close()
+            os.replace(tmp_path, DB_PATH)
+            for sidecar in _db_wal_paths(DB_PATH):
+                try:
+                    if os.path.exists(sidecar):
+                        os.remove(sidecar)
+                except OSError:
+                    pass
+        users = 0
+        try:
+            conn = _get_conn()
+            users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] or 0
+            conn.close()
+        except Exception:
+            pass
+        logger.info(f"[DB RESTORE] database replaced from {fname} ({users} users)")
+        _safe_send_message(
+            chat_id,
+            "\u2705 <b>Database restored!</b>\n\n"
+            + pe("archive", "\U0001f4c4") + " File: <code>" + html_mod.escape(fname) + "</code>\n"
+            + pe("people", "\U0001f465") + " Users: <code>" + str(users) + "</code>\n"
+            + pe("chat", "\U0001f4e5") + " Pre-import backup: <code>" + html_mod.escape(os.path.basename(safety)) + "</code>\n\n"
+            "Panels keep running; restart the app if anything looks stale.",
+            parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"[DB RESTORE] swap failed: {e}")
+        _say("\u274c <b>Restore failed:</b> " + html_mod.escape(str(e)[:200]) +
+             "\n\nThe live database was NOT changed.")
+    finally:
+        clear_state(message)
+        try:
+            if os.path.isfile(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+
+
 def show_admin_panel(chat_id, message_id=None):
     if not is_admin(chat_id):
         return
@@ -8176,6 +8406,7 @@ def get_admin_menu():
         ibtn("\U0001f4e9 MYSMS Portal", callback_data="mysms_menu", style="primary", icon="link"),
         ibtn("\U0001f4f1 NUMBER PANEL", callback_data="np_menu", style="primary", icon="link"),
         ibtn("\U0001f4e9 NUMBER API", callback_data="admin_numberapi_panel", style="success", icon="link"),
+        ibtn("\U0001f5c2 DB Backup", callback_data="admin_db_backup", style="danger", icon="archive"),
         ibtn("Settings", callback_data="admin_settings", style="danger", icon="settings"),
         ibtn("Admins", callback_data="admin_manage_admins", style="primary", icon="admin"),
         ibtn("Leave", callback_data="nav_back", style="danger", icon="back")
@@ -8865,6 +9096,32 @@ def handle_admin_callback(call, data, chat_id, msg_id):
         if _evs_mysms_callbacks(call, data, chat_id, msg_id):
             return
 
+    if data == "admin_db_backup":
+        if not is_admin(call.from_user.id):
+            bot.answer_callback_query(call.id, "Admins only.", show_alert=True)
+            return True
+        show_db_backup_menu(chat_id, msg_id)
+        return True
+    if data == "admin_db_export":
+        if not is_admin(call.from_user.id):
+            bot.answer_callback_query(call.id, "Admins only.", show_alert=True)
+            return True
+        bot.answer_callback_query(call.id, "\U0001f4e6 Building database snapshot...")
+        threading.Thread(target=admin_db_export_worker, args=(chat_id,), daemon=True).start()
+        return True
+    if data == "admin_db_import":
+        if not is_admin(call.from_user.id):
+            bot.answer_callback_query(call.id, "Admins only.", show_alert=True)
+            return True
+        set_state(chat_id, {"db_step": "await_upload"})
+        markup = types.InlineKeyboardMarkup()
+        markup.add(ibtn("Cancel", callback_data="admin_db_backup", style="danger", icon="back"))
+        _safe_edit_message_text(
+            "\U0001f4e4 <b>Send the database file (.db)</b> as a document.\n\n"
+            "\u26a0\ufe0f This <b>replaces all live data</b>. A pre-import backup is kept automatically.\n"
+            "Only upload a file this bot exported earlier.",
+            chat_id=chat_id, message_id=msg_id, parse_mode="HTML", reply_markup=markup)
+        return True
     if data == "admin_settings":
         user_states.pop(chat_id, None)
         rt_otp = get_setting('realtime_otp_admin') == '1'
