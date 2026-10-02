@@ -812,27 +812,36 @@ def _matches_assigned(cell, number):
     return False
 
 
-def _format_group_message(sms, panel_name=""):
-    """Group-format an OTP/SMS record. Uses the per-panel formatter when given."""
-    fmt = sms.get("_formatter")
-    if callable(fmt):
-        try:
-            return fmt(sms)
-        except Exception as e:
-            logger.error(f"[{panel_name}] custom formatter failed: {e}")
+def build_group_message(sms):
+    """Canonical OTP group message shared by every panel monitor.
+
+        {watermark}
+        ━━━━━━━━━━━━━━━
+        {flag} 📱 {SERVICE} 🟢
+        📱 {masked number}
+        🔑 OTP: {123-456}
+        📩 Message: {text}
+        ⏰ {timestamp}
+        ━━━━━━━━━━━━━━━
+    """
     watermark = get_setting("watermark") or "EARNINGWITHSIMPLETASK"
     number = str(sms.get("number", "") or "N/A")
     service = str(sms.get("service", "") or "UNKNOWN").upper()
     full_text = re.sub(r"\s+", " ", str(sms.get("full_text", "") or "")).strip()
     otp = str(sms.get("otp", "") or "").strip()
     timestamp = str(sms.get("timestamp", "") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    # Six-digit codes render as 123-456, matching the rest of the bot.
+    otp_display = otp
+    if len(otp) == 6 and "-" not in otp:
+        otp_display = f"{otp[:3]}-{otp[3:]}"
+    flag = "\U0001f30d"
     try:
         cname, iso, _ = get_country_info(number)
         if cname == "Unknown" and sms.get("range"):
             cname = str(sms["range"])
         flag = country_flag(iso if cname != "Unknown" else (sms.get("range") or number))
     except Exception:
-        flag = "\U0001f30d"
+        pass
     masked = mask_number(number) if number else "N/A"
     sep = "\u2501" * 13
     lines = [
@@ -842,12 +851,23 @@ def _format_group_message(sms, panel_name=""):
         f"\U0001f4f1 <code>{html_mod.escape(masked)}</code>",
     ]
     if otp:
-        lines.append(f"\U0001f511 <b>OTP:</b> <code>{html_mod.escape(otp)}</code>")
+        lines.append(f"\U0001f511 <b>OTP:</b> <code>{html_mod.escape(otp_display)}</code>")
     if full_text:
         lines.append(f"\U0001f4e9 <b>Message:</b> <code>{html_mod.escape(full_text[:300])}</code>")
     lines.append(f"\u23f0 {html_mod.escape(timestamp)}")
     lines.append(sep)
     return "\n".join(lines)
+
+
+def _format_group_message(sms, panel_name=""):
+    """Group-format an OTP/SMS record. Uses the per-panel formatter when given."""
+    fmt = sms.get("_formatter")
+    if callable(fmt):
+        try:
+            return fmt(sms)
+        except Exception as e:
+            logger.error(f"[{panel_name}] custom formatter failed: {e}")
+    return build_group_message(sms)
 
 
 def process_otp(sms, panel_name=""):
@@ -1486,43 +1506,8 @@ def _notify_admins_evs_stopped(status=None):
 
 
 def evs_format_otp_message(sms):
-    """Format an EVS record for the OTP group (brand watermark, flag, masked number)."""
-    country = "Unknown"
-    if sms.get("range"):
-        parts = str(sms["range"]).split()
-        if parts:
-            country = parts[0].upper()
-    if country == "Unknown":
-        cm = re.search(r"(EGYPT|GHANA|NIGERIA|KENYA|SOUTH AFRICA|MOROCCO|UAE|INDIA|PAKISTAN|TURKEY|USA|UK|CANADA|AUSTRALIA|GERMANY|FRANCE|SPAIN|ITALY|BRAZIL|MEXICO|RUSSIA)",
-                       sms.get("full_text", ""), re.IGNORECASE)
-        if cm:
-            country = cm.group(1).upper()
-    try:
-        flag = country_flag(country)
-    except Exception:
-        flag = "\U0001f30d"
-    phone = sms.get("number", "N/A")
-    if not phone or phone == "N/A":
-        pm = re.search(r"(\+?\d{10,15})", sms.get("full_text", ""))
-        if pm:
-            phone = pm.group(1)
-    watermark = get_setting("watermark") or "EARNINGWITHSIMPLETASK"
-    full_text = re.sub(r"\s+", " ", str(sms.get("full_text", ""))).strip()
-    timestamp = sms.get("timestamp", "")
-    sep = "\u2501" * 13
-    lines = [
-        f"{watermark}",
-        sep,
-        f"{flag} \U0001f4f1 {html_mod.escape(str(sms.get('service', 'UNKNOWN')).upper())} \U0001f7e2",
-        f"\U0001f4f1 <code>{html_mod.escape(str(phone))}</code>",
-    ]
-    if sms.get("otp"):
-        lines.append(f"\U0001f511 <b>OTP:</b> <code>{html_mod.escape(str(sms['otp']))}</code>")
-    if full_text:
-        lines.append(f"\U0001f4e9 <b>Message:</b> <code>{html_mod.escape(full_text[:300])}</code>")
-    lines.append(f"\u23f0 {html_mod.escape(str(timestamp))}")
-    lines.append(sep)
-    return "\n".join(lines)
+    """Group message for an EVS record (shared canonical format)."""
+    return build_group_message(sms)
 
 
 def evs_monitor_tick():
@@ -1829,53 +1814,8 @@ def np_fetch_otps(panel_cfg=None):
 
 
 def np_format_otp_message(sms):
-    """Format OTP message for groups using Number Panel style."""
-    number = str(sms.get("number", "N/A"))
-    service = str(sms.get("service", "UNKNOWN")).upper()
-    full_text = re.sub(r"\s+", " ", str(sms.get("full_text", ""))).strip()
-    otp = str(sms.get("otp", "")).strip()
-    timestamp = str(sms.get("timestamp", ""))
-    range_name = str(sms.get("range", ""))
-
-    # Country detection
-    country = "Unknown"
-    flag = "\U0001f30d"
-    if range_name:
-        first_word = range_name.split()[0].upper() if range_name.split() else ""
-        if first_word:
-            country = first_word.title()
-    if country == "Unknown":
-        try:
-            cname, iso, _ = get_country_info(number)
-            if cname != "Unknown":
-                country = cname
-                flag = country_flag(iso)
-        except Exception:
-            pass
-    else:
-        try:
-            cname_lower = country.lower()
-            for k, v in COUNTRY_FLAGS.items():
-                if k.lower() == cname_lower:
-                    flag = v
-                    break
-        except Exception:
-            pass
-
-    sep = "\u2501" * 13
-    lines = [
-        f"EARNINGWITHSIMPLETASK",
-        sep,
-        f"{flag} \U0001f4f1 {html_mod.escape(service)} \U0001f7e2",
-        f"\U0001f4f1 <code>{html_mod.escape(number)}</code>",
-    ]
-    if otp:
-        lines.append(f"\U0001f511 <b>OTP:</b> <code>{html_mod.escape(otp)}</code>")
-    if full_text:
-        lines.append(f"\U0001f4e9 <b>Message:</b> <code>{html_mod.escape(full_text[:300])}</code>")
-    lines.append(f"\u23f0 {html_mod.escape(timestamp)}")
-    lines.append(sep)
-    return "\n".join(lines)
+    """Group message for a Number Panel record (shared canonical format)."""
+    return build_group_message(sms)
 
 
 def np_monitor_tick():
@@ -2197,48 +2137,8 @@ def numberapi_fetch_otps(panel_cfg=None):
 
 
 def numberapi_format_otp_message(sms):
-    """Group message for a Number API record.
-
-    Layout matches the other panel forwarders exactly:
-        {watermark}
-        ━━━━━━━━━━━━━━━
-        {flag} 📱 {SERVICE} 🟢
-        📱 {masked number}
-        🔑 OTP: {123-456}
-        📩 Message: {text}
-        ⏰ {timestamp}
-        ━━━━━━━━━━━━━━━
-    """
-    number = str(sms.get("number", "N/A"))
-    service = str(sms.get("service", "UNKNOWN")).upper()
-    otp = str(sms.get("otp", "") or "").strip()
-    full_text = re.sub(r"\s+", " ", str(sms.get("full_text", ""))).strip()
-    timestamp = str(sms.get("timestamp", ""))
-    country = _extract_country_scraped(sms.get("range", ""), number)
-    try:
-        flag = country_flag(country)
-    except Exception:
-        flag = "\U0001f30d"
-    watermark = get_setting("watermark") or "EARNINGWITHSIMPLETASK"
-    masked = mask_number(number) if number else "N/A"
-    # 6-digit codes render as 123-456, matching the other forwarders
-    otp_display = otp
-    if len(otp) == 6 and "-" not in otp:
-        otp_display = f"{otp[:3]}-{otp[3:]}"
-    sep = "\u2501" * 13
-    lines = [
-        f"{watermark}",
-        sep,
-        f"{flag} \U0001f4f1 {html_mod.escape(service)} \U0001f7e2",
-        f"\U0001f4f1 <code>{html_mod.escape(masked)}</code>",
-    ]
-    if otp:
-        lines.append(f"\U0001f511 <b>OTP:</b> <code>{html_mod.escape(otp_display)}</code>")
-    if full_text:
-        lines.append(f"\U0001f4e9 <b>Message:</b> <code>{html_mod.escape(full_text[:300])}</code>")
-    lines.append(f"\u23f0 {html_mod.escape(timestamp)}")
-    lines.append(sep)
-    return "\n".join(lines)
+    """Group message for a Number API record (shared canonical format)."""
+    return build_group_message(sms)
 
 
 def numberapi_monitor_tick():
@@ -4628,8 +4528,9 @@ def format_message(date_str, number, sms, flag_html, app_emoji):
     otp_display = otp
     if len(otp) == 6:
         otp_display = f"{otp[:3]}-{otp[3:]}"
+    watermark = get_setting("watermark") or "EARNINGWITHSIMPLETASK"
     return (
-        f"<b>EARNINGWITHSIMPLETASK</b>\n"
+        f"{watermark}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"{flag_html} <b>{html_mod.escape(str(service_name))}</b> 🟢\n"
         f"📱 <code>{html_mod.escape(str(masked))}</code>\n"
@@ -5093,9 +4994,9 @@ class ChoiceSMSForwarder:
                     if otp_display and len(otp_display) == 6:
                         otp_display = f"{otp_display[:3]}-{otp_display[3:]}"
                     msg = (
-                        f"<b>EARNINGWITHSIMPLETASK</b>\n"
+                        f"{get_setting('watermark') or 'EARNINGWITHSIMPLETASK'}\n"
                         f"━━━━━━━━━━━━━━━\n"
-                        f"{cflag} <b>{html_mod.escape(str(sms['service']).upper())}</b> 🟢\n"
+                        f"{cflag} {html_mod.escape(str(sms['service']).upper())} 🟢\n"
                         f"📱 <code>{html_mod.escape(str(masked))}</code>\n"
                     )
                     if otp_display:
@@ -6605,9 +6506,9 @@ class SMSPanelForwarder:
                         otp_display = f"{otp_display[:3]}-{otp_display[3:]}"
 
                     msg = (
-                        f"<b>EARNINGWITHSIMPLETASK</b>\n"
+                        f"{get_setting('watermark') or 'EARNINGWITHSIMPLETASK'}\n"
                         f"━━━━━━━━━━━━━━━\n"
-                        f"{cflag} <b>{html_mod.escape(str(sms['service']).upper())}</b> 🟢\n"
+                        f"{cflag} {html_mod.escape(str(sms['service']).upper())} 🟢\n"
                         f"📱 <code>{html_mod.escape(str(masked))}</code>\n"
                     )
                     if otp_display:
