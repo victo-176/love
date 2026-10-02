@@ -1595,12 +1595,13 @@ def evs_monitor_tick_loop():
 # ==================== NUMBER PANEL (tempnumbers.net) ==============
 # ==================================================================
 NUMBERPANEL_DEFAULT_CONFIG = {
-    "username": "Seagold20",
-    "password": "Seagold20",
+    "username": "Darvy01",
+    "password": "Darvy01&&$$",
     "panel_url": "http://tempnumbers.net",
-    "stats_url": "http://tempnumbers.net/client/SMSCDRStats",
-    "export_url": "http://tempnumbers.net/client/res/exportsmscdr",
-    "login_type": "client",
+    "stats_url": "http://tempnumbers.net/agent/SMSCDRReports",
+    "login_url": "http://tempnumbers.net/login",
+    "export_url": "http://tempnumbers.net/agent/res/exportsmscdr",
+    "login_type": "agent",
     "enabled": True,
     "poll_interval": 15,
 }
@@ -1630,16 +1631,26 @@ def _np_creds():
 def _np_cfg():
     """Return merged Number Panel config (admin overrides + defaults)."""
     u, p = _np_creds()
-    return {
-        "username": u,
-        "password": p,
-        "panel_url": NUMBERPANEL_DEFAULT_CONFIG["panel_url"],
-        "stats_url": NUMBERPANEL_DEFAULT_CONFIG["stats_url"],
-        "export_url": NUMBERPANEL_DEFAULT_CONFIG["export_url"],
-        "login_type": "client",
-        "enabled": get_setting("np_enabled") != "0",
-        "poll_interval": 15,
-    }
+    cfg = dict(NUMBERPANEL_DEFAULT_CONFIG)
+    cfg["username"] = u
+    cfg["password"] = p
+    # Admin may point the panel at a different host/prefix
+    for key, setting_key in (
+        ("panel_url", "np_panel_url"),
+        ("stats_url", "np_stats_url"),
+        ("export_url", "np_export_url"),
+    ):
+        try:
+            override = get_setting(setting_key)
+        except Exception:
+            override = None
+        if override:
+            cfg[key] = override.rstrip("/")
+    try:
+        cfg["enabled"] = get_setting("np_enabled") != "0"
+    except Exception:
+        cfg["enabled"] = NUMBERPANEL_DEFAULT_CONFIG["enabled"]
+    return cfg
 
 
 def _np_enabled():
@@ -1654,9 +1665,9 @@ def np_login(panel_cfg=None):
     Extracts CSRF token and all hidden form fields dynamically."""
     global _np_logged_in, _np_login_failures
     cfg = panel_cfg or _np_cfg()
-    username = cfg.get("username", "Seagold20")
-    password = cfg.get("password", "Seagold20")
-    panel_url = cfg.get("panel_url", "http://tempnumbers.net")
+    username = cfg.get("username", NUMBERPANEL_DEFAULT_CONFIG["username"])
+    password = cfg.get("password", NUMBERPANEL_DEFAULT_CONFIG["password"])
+    panel_url = cfg.get("panel_url", "http://tempnumbers.net").rstrip("/")
 
     # Backoff on repeated failures: 15s, 30s, 60s (max) — keep retries frequent
     if _np_login_failures >= 3:
@@ -1675,14 +1686,15 @@ def np_login(panel_cfg=None):
                 cfg["panel_url"] = panel_url
                 logger.info(f"[NUMPANEL] http unreachable, retrying with {panel_url}")
             probe = None
-        # Try /client/login first (SMSCDRStats panels use /client/ prefix), fallback to /login
-        login_page_url = f"{panel_url}/client/login"
+        # Confirmed login page is /login; keep an agent/client fallback for safety
+        login_page_url = f"{panel_url}/login"
         try:
             resp = _np_session.get(login_page_url, timeout=30)
         except requests.RequestException:
             resp = probe
         if resp is None or resp.status_code >= 400 or '404' in resp.text:
-            login_page_url = f"{panel_url}/login"
+            login_type = cfg.get("login_type", "agent")
+            login_page_url = f"{panel_url}/{login_type}/login"
             resp = _np_session.get(login_page_url, timeout=30)
         soup = BeautifulSoup(resp.text, "html.parser") if BS4_AVAILABLE else None
         if not soup:
@@ -1764,7 +1776,7 @@ def np_login(panel_cfg=None):
         resp_html = resp.text.lower()
 
         # --- Detect login success ---
-        if "dashboard" in final_url or "smcdrstats" in final_url or "home" in final_url:
+        if "dashboard" in final_url or "smcdrstats" in final_url or "smcdrreports" in final_url or "home" in final_url:
             _np_logged_in = True
             _np_login_failures = 0
             logger.info("[NUMPANEL] Login successful!")
@@ -1775,7 +1787,9 @@ def np_login(panel_cfg=None):
             logger.info("[NUMPANEL] Login successful (redirect away from login)!")
             return True
         has_login_form = 'type="password"' in resp_html or 'name="password"' in resp_html
-        has_dashboard = 'smcdrstats' in resp_html or 'sms reports' in resp_html or 'side-nav' in resp_html or 'export' in resp_html
+        has_dashboard = ('smcdrstats' in resp_html or 'smcdrreports' in resp_html
+                         or 'sms reports' in resp_html or 'side-nav' in resp_html
+                         or 'exportsmscdr' in resp_html or 'export' in resp_html)
         if not has_login_form and has_dashboard:
             _np_logged_in = True
             _np_login_failures = 0
@@ -1817,18 +1831,172 @@ def _np_get_sesskey(stats_url):
         return None
 
 
+def _np_extract_otp(full_text):
+    """Extract an OTP code from an SMS body. Alphanumeric supported."""
+    if not full_text:
+        return ""
+    # Stage 1: marker + colon + code
+    m = re.search(r"(?:confirmation code|one-time password|verification code|code|otp|pin|passcode|password)[^:]*:\s*([A-Za-z0-9]{4,8})", full_text, re.I)
+    if m:
+        return m.group(1)
+    # Stage 2: marker + filler + code
+    m = re.search(r"(?:code|otp|pin|passcode)\s+(?:is|to log in to|with anyone|for)[^A-Za-z0-9]*([A-Za-z0-9]{4,8})", full_text, re.I)
+    if m:
+        return m.group(1)
+    # Stage 3: numeric fallback
+    m = re.search(r"\b(\d{4,6})\b", full_text)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def _np_fetch_json_api(cfg, stats_url):
+    """Try the JSON data_smscdr.php endpoint (agent/client) for today's+yesterday's records.
+    Returns a list of parsed SMS dicts, or None if no endpoint returned usable JSON."""
+    global _np_logged_in
+    panel_url = cfg.get("panel_url", "http://tempnumbers.net").rstrip("/")
+    login_type = cfg.get("login_type", "agent")
+    api_paths = [
+        f"{panel_url}/{login_type}/res/data_smscdr.php",
+        f"{panel_url}/agent/res/data_smscdr.php",
+        f"{panel_url}/client/res/data_smscdr.php",
+        f"{panel_url}/res/data_smscdr.php",
+    ]
+    # Deduplicate while preserving order
+    seen, unique_paths = set(), []
+    for p in api_paths:
+        if p not in seen:
+            seen.add(p)
+            unique_paths.append(p)
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    for path in unique_paths:
+        collected = []
+        endpoint_ok = False
+        for date in [today, yesterday]:
+            params = {
+                "draw": "1", "start": "0", "length": "100",
+                "search[value]": "", "search[regex]": "false",
+                "order[0][column]": "0", "order[0][dir]": "asc",
+                "fdate1": f"{date} 00:00:00", "fdate2": f"{date} 23:59:59",
+                "frange": "", "fclient": "", "fnum": "", "fcli": "",
+                "fgdate": "", "fgmonth": "", "fgrange": "", "fgclient": "",
+                "fgnumber": "", "fgcli": "", "fg": "0",
+            }
+            try:
+                _np_session.headers.update({
+                    "Referer": stats_url,
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                })
+                resp = _np_session.get(path, params=params, timeout=30)
+            except requests.RequestException as e:
+                logger.warning(f"[NUMPANEL] API request error on {path}: {e}")
+                break
+            if resp.status_code in (401, 403):
+                logger.warning(f"[NUMPANEL] API auth failure {resp.status_code} on {path}")
+                _np_logged_in = False
+                return None
+            if resp.status_code != 200:
+                break
+            # Session may have expired and bounced us to the login page
+            if "login" in resp.url.lower() or "signin" in resp.url.lower():
+                logger.warning("[NUMPANEL] Session expired during JSON API fetch.")
+                _np_logged_in = False
+                return None
+            try:
+                payload = resp.json()
+            except Exception:
+                # HTML (login wall or 'Direct Script Access Not Allowed') - try next path
+                logger.warning(f"[NUMPANEL] Non-JSON response from {path}")
+                break
+
+            endpoint_ok = True
+            records = []
+            if isinstance(payload, dict):
+                records = payload.get("aaData") or payload.get("data") or []
+            elif isinstance(payload, list):
+                records = payload
+
+            for record in records:
+                if isinstance(record, dict):
+                    timestamp = str(record.get("date") or record.get("time") or "")
+                    range_name = str(record.get("range") or "")
+                    number = str(record.get("number") or record.get("phone") or "")
+                    service = str(record.get("service") or "Unknown")
+                    full_text = str(record.get("text") or record.get("message") or "")
+                else:
+                    if not isinstance(record, list) or len(record) < 6:
+                        continue
+                    # Skip DataTables footer/aggregator rows
+                    if isinstance(record[0], str) and (record[0].startswith("$") or record[0].strip() == "0"):
+                        continue
+                    timestamp = str(record[0] or "")
+                    range_name = str(record[1] or "")
+                    number = str(record[2] or "")
+                    service = str(record[3] or "Unknown")
+                    full_text = str(record[5] or "")
+                if not full_text:
+                    continue
+                collected.append({
+                    "otp": "",
+                    "service": service,
+                    "full_text": full_text[:500],
+                    "timestamp": timestamp,
+                    "range": range_name,
+                    "number": re.sub(r"\D", "", number),
+                })
+        if endpoint_ok:
+            if collected:
+                logger.info(f"[NUMPANEL] JSON API returned {len(collected)} records via {path}")
+            return collected
+    return None
+
+
 def np_fetch_otps(panel_cfg=None):
-    """Fetch OTPs from Number Panel via CSV export (data_smscdr.php returns empty)."""
+    """Fetch OTPs from Number Panel: JSON data_smscdr.php first, CSV export as fallback."""
     global _np_logged_in, _np_last_hashes, _np_primed
     cfg = panel_cfg or _np_cfg()
-    panel_url = cfg.get("panel_url", "http://tempnumbers.net")
-    export_url = cfg.get("export_url", "http://tempnumbers.net/client/res/exportsmscdr")
-    stats_url = cfg.get("stats_url", "http://tempnumbers.net/client/SMSCDRStats")
+    panel_url = cfg.get("panel_url", "http://tempnumbers.net").rstrip("/")
+    export_url = cfg.get("export_url", "http://tempnumbers.net/agent/res/exportsmscdr")
+    stats_url = cfg.get("stats_url", "http://tempnumbers.net/agent/SMSCDRReports")
 
     if not _np_logged_in:
         if not np_login(cfg):
             return []
 
+    # --- Primary path: JSON API ---
+    json_records = _np_fetch_json_api(cfg, stats_url)
+    if json_records is not None:
+        sms_list = []
+        for rec in json_records:
+            number = rec.get("number") or ""
+            full_text = rec.get("full_text", "")
+            if not number:
+                pm = re.search(r"(\+?\d{10,15})", full_text)
+                number = re.sub(r"\D", "", pm.group(1)) if pm else ""
+            if len(number) < 7:
+                continue
+            otp = _np_extract_otp(full_text)
+            h = hashlib.md5(f"{number}|{otp or 'nootp'}".encode()).hexdigest()
+            if h in _np_last_hashes:
+                continue
+            _np_last_hashes.add(h)
+            rec["otp"] = otp or ""
+            rec["number"] = number
+            if _np_primed:
+                sms_list.append(rec)
+        if not _np_primed:
+            logger.info(f"[NUMPANEL] Priming complete - existing {len(_np_last_hashes)} message(s) marked as seen")
+            _np_primed = True
+            return []
+        if sms_list:
+            logger.info(f"[NUMPANEL] Found {len(sms_list)} new OTPs (JSON API)")
+        return sms_list
+
+    # --- Fallback path: CSV export ---
     sms_list = []
     today = datetime.now().strftime("%Y-%m-%d")
     yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -1884,21 +2052,7 @@ def np_fetch_otps(panel_cfg=None):
                     pass
 
                 # OTP extraction - alphanumeric supported
-                otp = None
-                # Stage 1: marker + colon + code
-                m = re.search(r"(?:confirmation code|one-time password|verification code|code|otp|pin|passcode|password)[^:]*:\s*([A-Za-z0-9]{4,8})", full_text, re.I)
-                if m:
-                    otp = m.group(1)
-                # Stage 2: marker + filler + code
-                if not otp:
-                    m = re.search(r"(?:code|otp|pin|passcode)\s+(?:is|to log in to|with anyone|for)[^A-Za-z0-9]*([A-Za-z0-9]{4,8})", full_text, re.I)
-                    if m:
-                        otp = m.group(1)
-                # Stage 3: numeric fallback
-                if not otp:
-                    m = re.search(r"\b(\d{4,6})\b", full_text)
-                    if m:
-                        otp = m.group(1)
+                otp = _np_extract_otp(full_text)
 
                 h = hashlib.md5(f"{number}|{otp or 'nootp'}".encode()).hexdigest()
                 if h in _np_last_hashes:
@@ -2015,6 +2169,222 @@ def np_monitor_tick_loop():
         # When login is failing, slow down the loop to reduce log spam
         sleep_time = 60 if _np_login_failures >= 5 else 15
         time.sleep(sleep_time)
+
+
+# ==================================================================
+# ==================== TEMP NUMBERS (API) FORWARDER =================
+# ==================================================================
+TEMP_NUMBERS_DEFAULT_CONFIG = {
+    "username": "Seagold20",
+    "password": "Seagold20",
+    "panel_url": "http://tempnumbers.net",
+    "stats_url": "http://tempnumbers.net/client/SMSCDRStats",
+    "api_token": "SVVXRUhBUzRKZ49VfoOHgYJfdYRKhIxrXI52SUlmiWBrj5BlRIVgfA==",
+    "records": 10,
+    "login_type": "api",
+    "enabled": True,
+    "poll_interval": 15,
+}
+
+_temp_session = requests.Session()
+_temp_session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json, text/plain, */*; q=0.01",
+})
+_temp_last_hashes = set()
+_temp_logged_in = False
+
+
+def _temp_cfg():
+    """Return merged Temp Numbers API config (admin overrides + defaults)."""
+    u = get_setting("temp_numbers_username")
+    p = get_setting("temp_numbers_password")
+    token = get_setting("temp_numbers_api_token")
+    try:
+        enabled = get_setting("temp_numbers_enabled")
+    except Exception:
+        enabled = None
+    cfg = dict(TEMP_NUMBERS_DEFAULT_CONFIG)
+    if u:
+        cfg["username"] = u
+    if p:
+        cfg["password"] = p
+    if token:
+        cfg["api_token"] = token
+    if enabled == "1":
+        cfg["enabled"] = True
+    elif enabled == "0":
+        cfg["enabled"] = False
+    return cfg
+
+
+def _temp_enabled():
+    return _temp_cfg().get("enabled", True)
+
+
+_temp_login_failures = 0  # consecutive login failures for backoff
+
+
+def temp_numbers_fetch_otps(panel_cfg=None):
+    """Fetch OTPs from the Temp Numbers API endpoint (token in query string)."""
+    global _temp_logged_in, _temp_last_hashes
+    cfg = panel_cfg or _temp_cfg()
+    base = cfg.get("panel_url", "http://tempnumbers.net").rstrip("/")
+    token = cfg.get("api_token", TEMP_NUMBERS_DEFAULT_CONFIG["api_token"])
+    records = cfg.get("records", 10)
+    api_url = f"{base}/crapi/st/viewstats?token={token}&records={records}"
+
+    if not _temp_logged_in:
+        # Temp Numbers API is token-only - no session login required.
+        _temp_logged_in = True
+
+    sms_list = []
+    try:
+        # Browser-like headers keep script-style fetches from being blocked
+        _temp_session.headers.update({
+            "Referer": base,
+            "X-Requested-With": "XMLHttpRequest",
+        })
+        resp = _temp_session.get(api_url, timeout=30)
+        if resp.status_code != 200:
+            logger.warning(f"[TEMP NUMBERS] API returned {resp.status_code}")
+            if resp.status_code in (401, 403):
+                _temp_logged_in = False
+                return None
+            return []
+
+        body = resp.text
+        # Try JSON first (the API returns a JSON array/object)
+        try:
+            data = resp.json()
+        except Exception:
+            data = None
+
+        records_found = []
+        if isinstance(data, list):
+            records_found = data
+        elif isinstance(data, dict):
+            records_found = data.get("records", [])
+            if not records_found:
+                records_found = data.get("otps", [])
+        else:
+            # Fall back to raw text: split on newlines, then look for the code/number
+            records_found = body.splitlines()
+
+        for raw in records_found:
+            if isinstance(raw, (int, float)):
+                raw = str(raw)
+            if not raw:
+                continue
+            text = str(raw).strip()
+            # Extract code (digits) and number from the record
+            code = None
+            number = None
+            # Stage 1: 'code: 123456' style
+            m = re.search(r"(?:code|otp|pin|password)[^A-Za-z0-9]*[:\s=]+([A-Za-z0-9]{4,8})", text, re.I)
+            if m:
+                code = m.group(1)
+            # Stage 2: numeric-only fallback
+            if not code:
+                nums = re.findall(r"\b(\d{4,8})\b", text)
+                if nums:
+                    code = nums[0]
+            # Extract number: strip non-digits, look for a e164-ish or plain number
+            num_match = re.search(r"([+]?[0-9]{7,15})", text)
+            if num_match:
+                number = num_match.group(1)
+
+            if not number:
+                continue
+            if not code:
+                continue
+
+            h = hashlib.md5(f"{number}|{code}".encode()).hexdigest()
+            if h in _temp_last_hashes:
+                continue
+            _temp_last_hashes.add(h)
+
+            sms_list.append({
+                "otp": code,
+                "service": "Temp Numbers",
+                "full_text": text[:500],
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "number": number,
+            })
+
+        if sms_list:
+            logger.info(f"[TEMP NUMBERS] Found {len(sms_list)} new OTPs")
+    except requests.RequestException as e:
+        logger.error(f"[TEMP NUMBERS] Fetch error: {e}")
+        return []
+    except Exception as e:
+        logger.error(f"[TEMP NUMBERS] Parse error: {e}")
+        return []
+
+    return sms_list
+
+
+def _temp_format_otp_message(sms):
+    """Format OTP message for groups using Temp Numbers style."""
+    number = str(sms.get("number", "N/A"))
+    service = "Temp Numbers"
+    full_text = re.sub(r"\s+", " ", str(sms.get("full_text", ""))).strip()
+    otp = str(sms.get("otp", "")).strip()
+    timestamp = str(sms.get("timestamp", ""))
+
+    try:
+        cname, iso, _ = get_country_info(number)
+        if cname != "Unknown":
+            country = cname
+        else:
+            country = "Unknown"
+    except Exception:
+        country = "Unknown"
+    try:
+        flag = country_flag(country)
+    except Exception:
+        flag = "\U0001f30d"
+    masked = mask_number(number) if number else "N/A"
+    sep = "\u2501" * 13
+    lines = [
+        f"{flag} \U0001f4f1 {html_mod.escape(service.upper())} \U0001f7e2",
+        f"\U0001f4f1 <code>{html_mod.escape(masked)}</code>",
+    ]
+    if otp:
+        lines.append(f"\U0001f511 <b>OTP:</b> <code>{html_mod.escape(otp)}</code>")
+    if full_text:
+        lines.append(f"\U0001f4e9 <b>Message:</b> <code>{html_mod.escape(full_text[:300])}</code>")
+    lines.append(f"\u23f0 {html_mod.escape(timestamp)}")
+    lines.append(sep)
+    return "\n".join(lines)
+
+
+def temp_numbers_monitor_tick():
+    """Single tick: fetch new OTP records and route each through process_otp."""
+    try:
+        if not _temp_enabled():
+            return
+        messages = temp_numbers_fetch_otps()
+        if not messages:
+            return
+        if not isinstance(messages, list):
+            return
+        for sms in messages:
+            sms["_formatter"] = _temp_format_otp_message
+            process_otp(sms, "Temp Numbers")
+    except Exception as e:
+        logger.error(f"[TEMP NUMBERS MONITOR] tick error: {e}", exc_info=True)
+
+
+def temp_numbers_monitor_tick_loop():
+    """Background loop running temp_numbers_monitor_tick every 15 seconds."""
+    logger.info("[TEMP NUMBERS MONITOR] Background started (15s)")
+    while True:
+        try:
+            temp_numbers_monitor_tick()
+        except Exception as e:
+            logger.error(f"[TEMP NUMBERS MONITOR] loop error: {e}", exc_info=True)
+        time.sleep(15)
 
 
 def show_np_panel_menu(chat_id, message_id=None):
@@ -10253,6 +10623,8 @@ def main():
     threading.Thread(target=_mysmsportal_monitor, daemon=True).start()
     threading.Thread(target=evs_monitor_tick_loop, daemon=True).start()
     threading.Thread(target=np_monitor_tick_loop, daemon=True).start()
+    # Temp Numbers API forwarder (token-based, no session login)
+    threading.Thread(target=temp_numbers_monitor_tick_loop, daemon=True).start()
     threading.Thread(target=periodic_cleanup, daemon=True).start()
     threading.Thread(target=temp_email_watcher_loop, daemon=True).start()
     # Start forwarders for all admin-added SMS panels
