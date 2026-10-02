@@ -1933,6 +1933,346 @@ def show_np_panel_menu(chat_id, message_id=None):
     _safe_send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
 
 
+# ==========================================================
+# === ADDED: NUMBER PANEL API (CRAPI viewstats) MONITOR ===
+# ==========================================================
+# Defaults are hardcoded fallbacks; any admin-set value overrides them.
+NUMBERAPI_DEFAULT_CONFIG = {
+    "enabled": True,
+    "base_url": "http://147.135.212.197/crapi/st",
+    "token": "SVVXRUhBUzRKZ49VfoOHgYJfdYRKhIxrXI52SUlmiWBrj5BlRIVgfA==",
+    "records": 10,
+    "poll_interval": 15,
+}
+
+_numberapi_session = requests.Session()
+_numberapi_session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json, text/plain, */*; q=0.01",
+})
+_numberapi_last_hashes = set()
+_numberapi_primed = False
+_numberapi_disabled_by_auth = False  # set when the API rejects the token
+
+
+def _extract_country_scraped(range_name="", number=""):
+    """Best-effort country name from a range string or phone number."""
+    if range_name:
+        first = str(range_name).split()[0] if str(range_name).split() else ""
+        if first and not first.isdigit():
+            return first.title()
+    try:
+        cname, _iso, _ = get_country_info(number)
+        if cname and cname != "Unknown":
+            return cname
+    except Exception:
+        pass
+    return "Unknown"
+
+
+def _extract_phone_scraped(*candidates):
+    """First plausible phone number (>=7 digits) among the candidates."""
+    for c in candidates:
+        if c is None:
+            continue
+        digits = re.sub(r"\D", "", str(c))
+        if len(digits) >= 7:
+            return digits
+    return ""
+
+
+def _extract_otp_scraped(text):
+    """OTP from an SMS body: colon marker, filler marker, then numeric fallback."""
+    if not text:
+        return ""
+    m = re.search(r"(?:confirmation code|one-time password|verification code|code|otp|pin|passcode)[^:]*:\s*([A-Za-z0-9]{4,8})", text, re.I)
+    if m:
+        return m.group(1)
+    m = re.search(r"(?:code|otp|pin|passcode)\s+(?:is|to log in to|with anyone|for)[^A-Za-z0-9]*([A-Za-z0-9]{4,8})", text, re.I)
+    if m:
+        return m.group(1)
+    m = re.search(r"\b(\d{4,6})\b", text)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def _numberapi_cfg():
+    """Merged Number API config: admin settings override the hardcoded defaults."""
+    cfg = dict(NUMBERAPI_DEFAULT_CONFIG)
+    try:
+        enabled = get_setting("numberapi_enabled")
+        if enabled == "0":
+            cfg["enabled"] = False
+        elif enabled == "1":
+            cfg["enabled"] = True
+    except Exception:
+        pass
+    for key, setting_key in (
+        ("base_url", "numberapi_base_url"),
+        ("token", "numberapi_token"),
+        ("records", "numberapi_records"),
+    ):
+        try:
+            val = get_setting(setting_key)
+        except Exception:
+            val = None
+        if not val:
+            continue
+        val = str(val).strip()
+        if key == "records":
+            try:
+                cfg["records"] = max(1, int(val))
+            except (TypeError, ValueError):
+                pass
+        else:
+            cfg[key] = val
+    return cfg
+
+
+def _notify_admins_numberapi(status=None):
+    """Tell admins the Number API token was rejected so they can fix it."""
+    try:
+        msg = ("\u26a0\ufe0f <b>Number Panel API stopped</b>\n"
+               f"Auth failure{'' if not status else f' (HTTP {status})'} - the API token was rejected.\n"
+               "Update it from Admin Panel > NUMBER API.")
+        for admin_id in get_all_admins():
+            try:
+                bot.send_message(admin_id, msg, parse_mode="HTML")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _numberapi_records(payload):
+    """Pull the record list out of a list/dict response."""
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("data", "records", "messages", "result"):
+            val = payload.get(key)
+            if isinstance(val, list):
+                return val
+        return []
+    return []
+
+
+def numberapi_fetch_otps(panel_cfg=None):
+    """Fetch and normalise OTPs from the Number Panel CRAPI viewstats endpoint."""
+    global _numberapi_primed
+    cfg = panel_cfg or _numberapi_cfg()
+    token = cfg.get("token", "")
+    if not token:
+        return []
+    base = str(cfg.get("base_url", "")).rstrip("/")
+    url = f"{base}/viewstats"
+    try:
+        _numberapi_session.headers.update({
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": base,
+        })
+        resp = _numberapi_session.get(
+            url, params={"token": token, "records": cfg.get("records", 10)}, timeout=30)
+    except requests.RequestException as e:
+        logger.error(f"[NUMBERAPI] fetch error: {e}")
+        return []
+
+    if resp.status_code in (401, 403):
+        logger.error(f"[NUMBERAPI] auth failed ({resp.status_code}) - token rejected.")
+        _notify_admins_numberapi(resp.status_code)
+        # Back off hard so we stop hammering a rejected token.
+        time.sleep(300)
+        return []
+    if resp.status_code != 200:
+        logger.warning(f"[NUMBERAPI] HTTP {resp.status_code}: {(resp.text or '')[:120]}")
+        return []
+
+    try:
+        payload = resp.json()
+    except ValueError:
+        logger.warning("[NUMBERAPI] non-JSON response")
+        return []
+
+    records = _numberapi_records(payload)
+    if not records:
+        return []
+
+    out = []
+    for rec in records:
+        try:
+            if isinstance(rec, dict):
+                full_text = str(rec.get("message") or rec.get("sms") or rec.get("text")
+                                or rec.get("body") or rec.get("content") or "")
+                number = _extract_phone_scraped(
+                    rec.get("num"), rec.get("number"), rec.get("phone"),
+                    rec.get("msisdn"), rec.get("recipient"))
+                service = str(rec.get("cli") or rec.get("service") or rec.get("sender")
+                              or rec.get("app") or rec.get("originator") or "Unknown")
+                otp = str(rec.get("otp") or rec.get("code") or rec.get("sms_code")
+                          or rec.get("verification_code") or "")
+                timestamp = str(rec.get("time") or rec.get("date") or rec.get("timestamp")
+                                or rec.get("created_at") or "")
+                range_name = str(rec.get("country") or rec.get("range") or "")
+            elif isinstance(rec, list):
+                # DataTables-style row: ts, range, number, service, cost, text
+                if len(rec) < 6:
+                    continue
+                if isinstance(rec[0], str) and (rec[0].startswith("$") or rec[0].strip() == "0"):
+                    continue
+                timestamp, range_name = str(rec[0] or ""), str(rec[1] or "")
+                number = _extract_phone_scraped(rec[2])
+                service, otp = str(rec[3] or "Unknown"), ""
+                full_text = str(rec[5] or "")
+            else:
+                full_text, number, service, otp, timestamp, range_name = (
+                    str(rec).strip(), "", "Unknown", "", "", "")
+
+            if not full_text:
+                continue
+
+            # Phone-hijack guard: credential text must never become the number.
+            if number and re.search(r"(?:username|password|pass|user)\s*:", full_text, re.I):
+                if re.search(r"(?:username|password|pass|user)\s*:", str(number), re.I):
+                    number = ""
+
+            if not number:
+                number = _extract_phone_scraped(full_text)
+            if not otp:
+                otp = _extract_otp_scraped(full_text)
+            if not range_name:
+                range_name = _extract_country_scraped("", number)
+
+            # Dedup: by number+otp when we have a code, else by message content.
+            digits = re.sub(r"\D", "", str(number))
+            if otp:
+                h = hashlib.md5(f"{digits}{otp}".encode()).hexdigest()
+            else:
+                h = hashlib.md5(
+                    "TXT|{}|{}|{}".format(digits, service, re.sub(r"\s+", " ", full_text).strip()).encode()
+                ).hexdigest()
+            if h in _numberapi_last_hashes:
+                continue
+            _numberapi_last_hashes.add(h)
+
+            if _numberapi_primed:
+                out.append({
+                    "otp": otp or "",
+                    "service": service,
+                    "full_text": full_text[:500],
+                    "timestamp": timestamp or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "range": range_name,
+                    "number": digits or "N/A",
+                })
+        except Exception as e:
+            logger.error(f"[NUMBERAPI] record parse error: {e}")
+            continue
+
+    if not _numberapi_primed:
+        logger.info(f"[NUMBERAPI] Priming complete - {len(_numberapi_last_hashes)} existing message(s) marked as seen")
+        _numberapi_primed = True
+        return []
+
+    if out:
+        logger.info(f"[NUMBERAPI] Found {len(out)} new OTPs")
+    return out
+
+
+def numberapi_format_otp_message(sms):
+    """Group message for a Number API record (full number, not masked)."""
+    number = str(sms.get("number", "N/A"))
+    service = str(sms.get("service", "UNKNOWN")).upper()
+    otp = str(sms.get("otp", "") or "").strip()
+    full_text = re.sub(r"\s+", " ", str(sms.get("full_text", ""))).strip()
+    timestamp = str(sms.get("timestamp", ""))
+    country = _extract_country_scraped(sms.get("range", ""), number)
+    try:
+        flag = country_flag(country)
+    except Exception:
+        flag = "\U0001f30d"
+    watermark = get_setting("watermark") or "EARNINGWITHSIMPLETASK"
+    sep = "\u2501" * 13
+    lines = [
+        f"{watermark}",
+        sep,
+        f"{flag} \U0001f4f1 {html_mod.escape(service)} \U0001f7e2",
+        f"\U0001f4f1 {html_mod.escape(number)}",
+    ]
+    if otp:
+        lines.append(f"\U0001f511 OTP: {html_mod.escape(otp)}")
+    if otp:
+        lines.append("Don't share this code with others")
+    lines.append(f"\u23f0 {html_mod.escape(timestamp)}")
+    lines.append(sep)
+    if full_text:
+        lines.append(f"<i>{html_mod.escape(full_text[:300])}</i>")
+    return "\n".join(lines)
+
+
+def numberapi_monitor_tick():
+    """One tick: fetch new OTPs and route each through the central processor."""
+    try:
+        cfg = _numberapi_cfg()
+        if not cfg.get("enabled", True):
+            return
+        if not cfg.get("token"):
+            return
+        messages = numberapi_fetch_otps(cfg)
+        if not messages:
+            return
+        for sms in messages:
+            sms["_formatter"] = numberapi_format_otp_message
+            process_otp(sms, "Number API")
+    except Exception as e:
+        logger.error(f"[NUMBERAPI MONITOR] tick error: {e}", exc_info=True)
+
+
+def numberapi_monitor_tick_loop():
+    """Background loop running numberapi_monitor_tick every 15 seconds."""
+    logger.info("[NUMBERAPI MONITOR] Background started (15s)")
+    while True:
+        try:
+            numberapi_monitor_tick()
+        except Exception as e:
+            logger.error(f"[NUMBERAPI MONITOR] loop error: {e}", exc_info=True)
+        time.sleep(15)
+
+
+def show_numberapi_panel_menu(chat_id, message_id=None):
+    """Admin menu for the Number Panel API monitor."""
+    cfg = _numberapi_cfg()
+    enabled = cfg.get("enabled", True)
+    token = str(cfg.get("token", "") or "")
+    token_disp = (token[:8] + "..." + token[-4:]) if len(token) > 14 else (token or "Not set")
+    status = "\U0001f7e2 ACTIVE" if enabled else "\U0001f534 DISABLED"
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(ibtn(f"\u26a1 {'DISABLE' if enabled else 'ENABLE'}",
+                    callback_data="numberapi_toggle",
+                    style="danger" if enabled else "success"))
+    markup.add(ibtn("\U0001f517 SET CREDENTIALS", callback_data="numberapi_set_creds", style="primary"))
+    markup.add(ibtn("\U0001f9ea TEST CONNECTION", callback_data="numberapi_test", style="success"),
+               ibtn("\U0001f519 BACK", callback_data="admin_panel", style="primary", icon="back"))
+    text = (
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"\U0001f4e9 <b>NUMBER API</b>\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+        f"\U0001f4ca <b>Status:</b> {status}\n"
+        f"\U0001f511 <b>Token:</b> <code>{html_mod.escape(token_disp)}</code>\n"
+        f"\U0001f517 <b>Base URL:</b> <code>{html_mod.escape(str(cfg.get('base_url', '')))}</code>\n"
+        f"\U0001f4c4 <b>Records:</b> {cfg.get('records', 10)}\n"
+        f"\u23f1 <b>Poll Interval:</b> {cfg.get('poll_interval', 15)}s\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+    )
+    if message_id:
+        try:
+            _safe_edit_message_text(text, chat_id=chat_id, message_id=message_id,
+                                    parse_mode="HTML", reply_markup=markup)
+            return
+        except Exception:
+            pass
+    _safe_send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
+
+
 # ============ EVS / MYSMS ADMIN PANEL MENUS ============
 def show_evs_panel_menu(chat_id, message_id=None):
     cfg = _evs_cfg()
@@ -2071,6 +2411,49 @@ def _evs_mysms_callbacks(call, data, chat_id, msg_id):
         return True
     if data == "np_menu":
         show_np_panel_menu(chat_id, msg_id)
+        return True
+    # --- Number Panel API (CRAPI viewstats) callbacks ---
+    if data in ("admin_numberapi_panel", "numberapi_menu"):
+        show_numberapi_panel_menu(chat_id, msg_id)
+        return True
+    if data == "numberapi_toggle":
+        cur = get_setting("numberapi_enabled")
+        set_setting("numberapi_enabled", "0" if (cur or "1") != "0" else "1")
+        bot.answer_callback_query(
+            call.id,
+            f"Number API {'DISABLED' if (cur or '1') != '0' else 'ENABLED'}",
+            show_alert=True)
+        show_numberapi_panel_menu(chat_id, msg_id)
+        return True
+    if data == "numberapi_set_creds":
+        set_state(chat_id, {"numberapi_step": "base_url"})
+        markup = types.InlineKeyboardMarkup()
+        markup.add(ibtn("Cancel", callback_data="numberapi_menu", style="danger", icon="back"))
+        bot.edit_message_text("\U0001f517 Send the Number API base URL (or send SKIP to keep the default):",
+                              chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
+        return True
+    if data == "numberapi_test":
+        bot.answer_callback_query(call.id, "\U0001f9ea Testing Number API...")
+        def _numberapi_test_worker():
+            try:
+                recs = numberapi_fetch_otps(_numberapi_cfg())
+                if recs is None:
+                    count = 0
+                else:
+                    count = len(recs)
+                bot.send_message(
+                    chat_id,
+                    "\u2705 <b>Number API reachable</b> - " + str(count) + " new record(s) on this check."
+                    if count else
+                    "\u2705 <b>Number API reachable</b> - no new records (token accepted).",
+                    parse_mode="HTML")
+            except Exception as e:
+                try:
+                    bot.send_message(chat_id, "\u274c <b>Number API test error:</b> " + html_mod.escape(str(e)[:150]),
+                                     parse_mode="HTML")
+                except Exception:
+                    pass
+        threading.Thread(target=_numberapi_test_worker, daemon=True).start()
         return True
     return False
 
@@ -7760,6 +8143,7 @@ def get_admin_menu():
         ibtn("\u26a1 EVS Panel", callback_data="evs_menu", style="primary", icon="link"),
         ibtn("\U0001f4e9 MYSMS Portal", callback_data="mysms_menu", style="primary", icon="link"),
         ibtn("\U0001f4f1 NUMBER PANEL", callback_data="np_menu", style="primary", icon="link"),
+        ibtn("\U0001f4e9 NUMBER API", callback_data="admin_numberapi_panel", style="success", icon="link"),
         ibtn("Settings", callback_data="admin_settings", style="danger", icon="settings"),
         ibtn("Admins", callback_data="admin_manage_admins", style="primary", icon="admin"),
         ibtn("Leave", callback_data="nav_back", style="danger", icon="back")
@@ -9806,6 +10190,72 @@ def broadcast_handler(message):
 
 
 
+# ======================== NUMBER API CREDENTIALS HANDLER ========================
+@bot.message_handler(func=lambda msg: isinstance(get_state(msg), dict)
+                     and get_state(msg).get("numberapi_step") and is_admin(msg.from_user.id))
+def numberapi_creds_handler(message):
+    """Step-by-step admin setup for the Number API: base URL, then token, then records."""
+    state = get_state(message)
+    step = state.get("numberapi_step")
+    value = (message.text or "").strip()
+    if not value:
+        bot.reply_to(message, "\u274c Value cannot be empty. Send the value or SKIP:", parse_mode="HTML")
+        return
+
+    def _cancel():
+        clear_state(message)
+        m = types.InlineKeyboardMarkup()
+        m.add(ibtn("Number API", callback_data="numberapi_menu", style="success", icon="link"))
+        bot.reply_to(message, "\u274c Setup cancelled.", parse_mode="HTML", reply_markup=m)
+
+    if step == "base_url":
+        if value.upper() != "SKIP":
+            set_setting("numberapi_base_url", value.rstrip("/"))
+        state["numberapi_step"] = "token"
+        set_state(message.chat.id, state)
+        m = types.InlineKeyboardMarkup()
+        m.add(ibtn("Cancel", callback_data="numberapi_menu", style="danger", icon="back"))
+        bot.reply_to(message, "\U0001f511 Send the Number API token (or SKIP to keep the default):",
+                     parse_mode="HTML", reply_markup=m)
+        return
+
+    if step == "token":
+        if value.upper() != "SKIP":
+            set_setting("numberapi_token", value)
+        state["numberapi_step"] = "records"
+        set_state(message.chat.id, state)
+        m = types.InlineKeyboardMarkup()
+        m.add(ibtn("Cancel", callback_data="numberapi_menu", style="danger", icon="back"))
+        bot.reply_to(message, "\U0001f4c4 Send how many records to fetch (e.g. 10), or SKIP for the default:",
+                     parse_mode="HTML", reply_markup=m)
+        return
+
+    if step == "records":
+        if value.upper() != "SKIP":
+            try:
+                set_setting("numberapi_records", str(max(1, int(value))))
+            except ValueError:
+                bot.reply_to(message, "\u274c Records must be a number. Send a number or SKIP:", parse_mode="HTML")
+                return
+        clear_state(message)
+        cfg = _numberapi_cfg()
+        m = types.InlineKeyboardMarkup()
+        m.add(ibtn("Number API", callback_data="numberapi_menu", style="success", icon="link"))
+        m.add(ibtn("Test Connection", callback_data="numberapi_test", style="success", icon="refresh"))
+        tok = str(cfg.get("token", "") or "")
+        tok_disp = (tok[:8] + "..." + tok[-4:]) if len(tok) > 14 else (tok or "Not set")
+        bot.reply_to(message,
+            pe("checkmark", "\u2705") + " <b>Number API settings saved!</b>\n\n"
+            + pe("link", "\U0001f517") + " Base URL: <code>" + html_mod.escape(str(cfg.get("base_url", ""))) + "</code>\n"
+            + pe("key", "\U0001f511") + " Token: <code>" + html_mod.escape(tok_disp) + "</code>\n"
+            + pe("record", "\U0001f4c4") + " Records: <code>" + str(cfg.get("records", 10)) + "</code>\n\n"
+            "The monitor is now polling this endpoint.",
+            parse_mode="HTML", reply_markup=m)
+        return
+
+    _cancel()
+
+
 # ======================== NUMBER PANEL API TOKEN HANDLER ========================
 @bot.message_handler(func=lambda msg: isinstance(get_state(msg), dict) and get_state(msg).get("np_step") == "token" and is_admin(msg.from_user.id))
 def np_token_handler(message):
@@ -10123,6 +10573,8 @@ def main():
     threading.Thread(target=_mysmsportal_monitor, daemon=True).start()
     threading.Thread(target=evs_monitor_tick_loop, daemon=True).start()
     threading.Thread(target=np_monitor_tick_loop, daemon=True).start()
+    # Number Panel API (CRAPI viewstats) monitor
+    threading.Thread(target=numberapi_monitor_tick_loop, daemon=True).start()
     threading.Thread(target=periodic_cleanup, daemon=True).start()
     threading.Thread(target=temp_email_watcher_loop, daemon=True).start()
     # Start forwarders for all admin-added SMS panels
