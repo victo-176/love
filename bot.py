@@ -2197,7 +2197,18 @@ def numberapi_fetch_otps(panel_cfg=None):
 
 
 def numberapi_format_otp_message(sms):
-    """Group message for a Number API record (full number, not masked)."""
+    """Group message for a Number API record.
+
+    Layout matches the other panel forwarders exactly:
+        {watermark}
+        ━━━━━━━━━━━━━━━
+        {flag} 📱 {SERVICE} 🟢
+        📱 {masked number}
+        🔑 OTP: {123-456}
+        📩 Message: {text}
+        ⏰ {timestamp}
+        ━━━━━━━━━━━━━━━
+    """
     number = str(sms.get("number", "N/A"))
     service = str(sms.get("service", "UNKNOWN")).upper()
     otp = str(sms.get("otp", "") or "").strip()
@@ -2209,21 +2220,24 @@ def numberapi_format_otp_message(sms):
     except Exception:
         flag = "\U0001f30d"
     watermark = get_setting("watermark") or "EARNINGWITHSIMPLETASK"
+    masked = mask_number(number) if number else "N/A"
+    # 6-digit codes render as 123-456, matching the other forwarders
+    otp_display = otp
+    if len(otp) == 6 and "-" not in otp:
+        otp_display = f"{otp[:3]}-{otp[3:]}"
     sep = "\u2501" * 13
     lines = [
         f"{watermark}",
         sep,
         f"{flag} \U0001f4f1 {html_mod.escape(service)} \U0001f7e2",
-        f"\U0001f4f1 {html_mod.escape(number)}",
+        f"\U0001f4f1 <code>{html_mod.escape(masked)}</code>",
     ]
     if otp:
-        lines.append(f"\U0001f511 OTP: {html_mod.escape(otp)}")
-    if otp:
-        lines.append("Don't share this code with others")
+        lines.append(f"\U0001f511 <b>OTP:</b> <code>{html_mod.escape(otp_display)}</code>")
+    if full_text:
+        lines.append(f"\U0001f4e9 <b>Message:</b> <code>{html_mod.escape(full_text[:300])}</code>")
     lines.append(f"\u23f0 {html_mod.escape(timestamp)}")
     lines.append(sep)
-    if full_text:
-        lines.append(f"<i>{html_mod.escape(full_text[:300])}</i>")
     return "\n".join(lines)
 
 
