@@ -3177,13 +3177,32 @@ def format_withdrawal_notification(user_id, amount, method, details, req_id):
     tg_line = f"{html_mod.escape(tname)}" if tname else "N/A"
     if uname:
         tg_line += f" (@{html_mod.escape(uname)})"
-    phone = html_mod.escape(str(details.get("phone", "") or details.get("upi_id", "") or ""))
+    # Account/phone field: each flow stores it under a different state key
+    # (Opay: withdraw_phone, UPI: withdraw_upi, Others: others_account),
+    # so check every variant — otherwise the Account No line never renders.
+    phone = html_mod.escape(str(
+        details.get("phone", "") or details.get("upi_id", "")
+        or details.get("withdraw_phone", "") or details.get("withdraw_upi", "")
+        or details.get("account_number", "") or details.get("others_account", "") or ""
+    ))
     address = html_mod.escape(str(details.get("address", "") or details.get("withdraw_address", "") or ""))
-    full_name = html_mod.escape(str(details.get("full_name", "") or details.get("withdraw_name", "") or ""))
+    full_name = html_mod.escape(str(
+        details.get("full_name", "") or details.get("withdraw_name", "")
+        or details.get("account_holder", "") or details.get("others_holder", "") or ""
+    ))
+    bank = str(details.get("bank_name", "") or details.get("others_bank", "") or "")
+    currency = str(details.get("currency", "") or details.get("others_currency", "") or "")
     extras = details.get("extras", {})
     extras_str = ""
     if extras:
         extras_str = "\n".join(f"{html_mod.escape(str(k).title())}: {html_mod.escape(str(v))}" for k, v in extras.items() if v)
+    extra_lines = []
+    if bank:
+        extra_lines.append(f"\U0001F3E6 <b>Bank:</b> {html_mod.escape(bank)}")
+    if currency:
+        extra_lines.append(f"\U0001F4B1 <b>Currency:</b> {html_mod.escape(currency)}")
+    if extra_lines:
+        extras_str = (extras_str + "\n" if extras_str else "") + "\n".join(extra_lines)
     rate = get_ngn_rate()
     ngn = get_ngn_amount(amount)
     msg = (
