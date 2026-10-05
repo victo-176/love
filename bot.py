@@ -2674,7 +2674,17 @@ def get_otp_price():
         return 0.006
 
 def get_price_for_number(number):
-    """Return the combo-specific price_per_otp for a number, or None if unset."""
+    """Return the combo-specific price_per_otp for a number, or None if unset.
+
+    Matching is normalized on both sides (digits only) and suffix-tolerant,
+    the same rule _cell_holds uses for assignments: uploaded files often store
+    numbers without the country code (or with +/spaces), while the incoming
+    OTP number is the full international form — strict equality never matched,
+    so uploads silently fell back to the global default price.
+    """
+    n_clean = clean_number(number)
+    if not n_clean:
+        return None
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -2684,7 +2694,22 @@ def get_price_for_number(number):
                 nums = json.loads(nums_json)
             except Exception:
                 continue
-            if number in [clean_number(n) for n in nums]:
+            matched = False
+            for n in nums:
+                p_clean = clean_number(n)
+                if not p_clean:
+                    continue
+                if p_clean == n_clean:
+                    matched = True
+                    break
+                # Suffix match (local vs international form) with a length
+                # guard so short codes can't false-match.
+                if min(len(p_clean), len(n_clean)) >= 7 and (
+                    p_clean.endswith(n_clean) or n_clean.endswith(p_clean)
+                ):
+                    matched = True
+                    break
+            if matched:
                 conn.close()
                 try:
                     return float(price) if price is not None else None
