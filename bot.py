@@ -8151,6 +8151,91 @@ def db_validate_candidate(path):
     return True, "ok"
 
 
+def _seed_live_user_count():
+    """Rows in users on the live DB (0 if unreadable -> let the restore try)."""
+    try:
+        conn = _get_conn()
+        row = conn.execute("SELECT COUNT(*) FROM users").fetchone()
+        conn.close()
+        return int(row[0]) if row else 0
+    except Exception:
+        return 0
+
+
+def find_bundled_db_backup():
+    """Newest bot-backup*.db shipped next to the code (root, cwd or data dir).
+
+    The exported snapshot is committed to the repo so a fresh deployment can boot
+    straight back into the saved data instead of an empty database.
+    """
+    search_dirs = []
+    for d in (os.path.dirname(os.path.abspath(__file__)), os.getcwd(), PERSISTENT_DIR):
+        if d and d not in search_dirs and os.path.isdir(d):
+            search_dirs.append(d)
+    candidates = []
+    for d in search_dirs:
+        try:
+            for name in os.listdir(d):
+                if name.startswith("bot-backup") and name.endswith(".db"):
+                    p = os.path.join(d, name)
+                    if os.path.isfile(p):
+                        candidates.append(p)
+        except OSError:
+            continue
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return candidates[0]
+
+
+def seed_database_from_backup():
+    """First-boot restore: load the bundled bot-backup*.db into an EMPTY database.
+
+    Never touches a database that already has users, so restarting an existing
+    instance is always safe. Returns True when the restore ran.
+    """
+    try:
+        if _seed_live_user_count() != 0:
+            logger.info("[DB SEED] live database already has users - bundled backup skipped")
+            return False
+        src = find_bundled_db_backup()
+        if not src:
+            logger.info("[DB SEED] no bundled bot-backup*.db found - starting fresh")
+            return False
+        ok, reason = db_validate_candidate(src)
+        if not ok:
+            logger.warning(f"[DB SEED] bundled backup rejected ({os.path.basename(src)}): {reason}")
+            return False
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        if db_size() > 0:
+            db_export_snapshot(os.path.join(PERSISTENT_DIR, f"bot-preseed-{stamp}.db"))
+        tmp = os.path.join(PERSISTENT_DIR, f"seed-{stamp}.db")
+        with open(src, "rb") as fi, open(tmp, "wb") as fo:
+            fo.write(fi.read())
+        with _db_lock:
+            conn = _get_conn()
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                pass
+            conn.close()
+            os.replace(tmp, DB_PATH)
+            for sidecar in _db_wal_paths(DB_PATH):
+                try:
+                    if os.path.exists(sidecar):
+                        os.remove(sidecar)
+                except OSError:
+                    pass
+        init_db()  # re-run migrations on the restored schema
+        users = _seed_live_user_count()
+        logger.info(f"[DB SEED] loaded bundled backup {os.path.basename(src)} "
+                    f"({users} users, {len(db_table_names(DB_PATH))} tables)")
+        return True
+    except Exception as e:
+        logger.error(f"[DB SEED] bundled backup load failed: {e}")
+        return False
+
+
 def show_db_backup_menu(chat_id, message_id=None):
     """Admin menu for database backup and restore."""
     size_mb = db_size() / (1024 * 1024)
@@ -10793,6 +10878,9 @@ _logging409.getLogger('telebot').addFilter(_SuppressTelegram409())
 
 
 def main():
+    # First boot (or wiped volume): load the .db backup bundled in the repo.
+    seed_database_from_backup()
+
     # Log DB status on startup
     try:
         otp_count = get_total_otp_count()
